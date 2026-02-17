@@ -19,12 +19,12 @@ class TranslationDataset(Dataset):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-    item = self.dataset[idx]
-    # opus-100 dùng key 'translation' thay vì 'source'/'target'
-    return {
-        'source': item['translation']['en'],
-        'target': item['translation']['vi'],
-    }
+        item = self.dataset[idx]
+        # opus-100 dùng key 'translation' thay vì 'source'/'target'
+        return {
+            'source': item['translation']['en'],
+            'target': item['translation']['vi'],
+        }
 
 
 @dataclass
