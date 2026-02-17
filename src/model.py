@@ -9,8 +9,8 @@ import spacy
 from transformers import (
     BertModel, 
     BertTokenizer,
-    MT5ForConditionalGeneration, 
-    MT5Tokenizer,
+    MT5ForConditionalGeneration,
+    AutoTokenizer,          # ← Thay MT5Tokenizer bằng AutoTokenizer
 )
 
 
@@ -38,7 +38,7 @@ class MultilingualNERTranslationModel(nn.Module):
         
         # ===== DECODER: mT5 =====
         self.decoder = MT5ForConditionalGeneration.from_pretrained(mt5_model_name)
-        self.decoder_tokenizer = MT5Tokenizer.from_pretrained(mt5_model_name)
+        self.decoder_tokenizer = AutoTokenizer.from_pretrained(mt5_model_name)
         
         # ===== PROJECTION LAYER =====
         self.encoder_to_decoder = nn.Linear(
