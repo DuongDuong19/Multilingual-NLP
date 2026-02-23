@@ -1,12 +1,12 @@
 # Multilingual-NLP
 
-###Install
+##Install
 ```bibtex
 pip install transformers protobuf seqeval accelerate sentencepiece tiktoken
 pip install "datasets<3.0.0"
 ```
 
-###Run
+##Run
 ```bibtex
 1. python models.py
 2. python train.py  (Full train (3 epochs, auto-save 30 phút))
