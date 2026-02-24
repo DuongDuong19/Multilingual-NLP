@@ -151,11 +151,12 @@ class MTT(nn.Module):
         # Step 4: Inject NER + Project
         projected = self.projector(enc_hidden + ner_emb)       # (B, src_len, 512)
 
-        # Step 5: mT5 decoder
+        # Step 5: mT5 decoder (use_cache=False bắt buộc khi gradient checkpointing bật)
         dec_hidden = self.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=projected,
             encoder_attention_mask=src_enc["attention_mask"],
+            use_cache=False,
         ).last_hidden_state                                    # (B, tgt_len, 512)
 
         # Step 6: LM head
@@ -181,48 +182,73 @@ class MTT(nn.Module):
         return total_loss, gen_loss.detach(), ner_loss.detach()
 
     # =========================================================================
-    # GENERATE (greedy decode)
+    # GENERATE
     # =========================================================================
 
     @torch.no_grad()
-    def generate(self, src_texts: list[str], max_new_tokens: int = 128):
-        """Input: raw string list → Output: decoded string list."""
+    def generate(
+        self,
+        src_texts: list[str],
+        max_new_tokens: int       = 64,
+        repetition_penalty: float = 1.5,  # > 1 → phạt token lặp lại
+    ):
+        """
+        Greedy decode + repetition penalty.
+        Input : raw source strings
+        Output: decoded strings
+        """
         device = next(self.encoder.parameters()).device
         B      = len(src_texts)
+        eos_id = self.dec_tokenizer.eos_token_id
+        pad_id = self.dec_tokenizer.pad_token_id
 
-        # Tokenize + Encode
+        # ── Encode ───────────────────────────────────────────────────────────
         src_enc    = self._tokenize_src(src_texts)
         enc_hidden = self.encoder(
             input_ids=src_enc["input_ids"],
             attention_mask=src_enc["attention_mask"],
         ).last_hidden_state
 
-        # NER + Project
         ner_emb   = self.nerEmbed(self.nerClassifier(enc_hidden).argmax(-1))
-        projected = self.projector(enc_hidden + ner_emb)
+        projected = self.projector(enc_hidden + ner_emb)   # (B, src_len, dec_dim)
 
-        # Greedy decode với KV cache
-        dec_ids = torch.full(
-            (B, 1), self.dec_tokenizer.pad_token_id,
-            dtype=torch.long, device=device,
-        )
-        past_kv = None
+        # ── Greedy decode ─────────────────────────────────────────────────────
+        dec_ids  = torch.full((B, 1), pad_id, dtype=torch.long, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
 
         for _ in range(max_new_tokens):
-            cur_input = dec_ids if past_kv is None else dec_ids[:, -1:]
-            dec_out   = self.decoder(
-                input_ids=cur_input,
+            dec_out = self.decoder(
+                input_ids=dec_ids,
                 encoder_hidden_states=projected,
                 encoder_attention_mask=src_enc["attention_mask"],
-                past_key_values=past_kv,
-                use_cache=True,
+                use_cache=False,
             )
-            past_kv  = dec_out.past_key_values
-            next_tok = self.lm_head(dec_out.last_hidden_state[:, -1]).argmax(-1, keepdim=True)
+            # Logits của token cuối cùng
+            logits = self.lm_head(dec_out.last_hidden_state[:, -1]).float()  # (B, vocab)
+
+            # Repetition penalty
+            for b in range(B):
+                seen = dec_ids[b].unique()
+                # Token xuất hiện nhiều hơn 1 lần bị phạt nặng hơn
+                for tok_id in seen:
+                    count = (dec_ids[b] == tok_id).sum().item()
+                    penalty = repetition_penalty ** count
+                    if logits[b, tok_id] > 0:
+                        logits[b, tok_id] /= penalty
+                    else:
+                        logits[b, tok_id] *= penalty
+
+            next_tok = logits.argmax(-1, keepdim=True)   # (B, 1)  greedy
+
+            # Sequence đã kết thúc → pad
+            next_tok[finished] = pad_id
             dec_ids  = torch.cat([dec_ids, next_tok], dim=1)
-            if (next_tok == self.dec_tokenizer.eos_token_id).all():
+
+            finished |= (next_tok.squeeze(-1) == eos_id)
+            if finished.all():
                 break
 
+        # Bỏ token BOS (pad_id đầu), decode
         return self.dec_tokenizer.batch_decode(dec_ids[:, 1:], skip_special_tokens=True)
 
     # =========================================================================

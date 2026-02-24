@@ -1,6 +1,5 @@
 """
 generate.py  –  Load checkpoint mới nhất và chạy inference.
-model.generate() nhận raw text trực tiếp.
 """
 
 import os
@@ -26,7 +25,7 @@ def load_model():
             path = os.path.join(CKPT_DIR, pts[-1])
 
     if path:
-        ckpt = torch.load(path, map_location=DEVICE)
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         print(f"[INFO] Loaded: {path}  (epoch={ckpt.get('epoch','?')}, step={ckpt.get('step','?')})")
     else:
@@ -35,14 +34,22 @@ def load_model():
     return model
 
 
-def run(texts: list[str], max_new_tokens: int = 128):
+def run(
+    texts: list[str],
+    max_new_tokens: int       = 64,
+    repetition_penalty: float = 1.5,
+):
     model = load_model()
     print("\n" + "═" * 60)
     with torch.no_grad():
-        outputs = model.generate(texts, max_new_tokens=max_new_tokens)
+        outputs = model.generate(
+            texts,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=repetition_penalty,
+        )
     for src, out in zip(texts, outputs):
         print(f"  SRC : {src}")
-        print(f"  OUT : {out if out.strip() else '(empty)'}")
+        print(f"  OUT : {out if out.strip() else '(empty – model cần train thêm)'}")
         print()
     print("═" * 60)
 
