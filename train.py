@@ -1,274 +1,274 @@
 """
-train.py  —  python train.py [--batch_size N]
-Dataset : Helsinki-NLP/opus-100  (100 cặp ngôn ngữ)
-Dừng    : Ctrl+C, checkpoint tự lưu.
+model.py
+Pipeline: raw text → Tokenizer → mmBERT-small → NER → Projector → mT5-small decoder → text
 """
 
-import os, time, json, logging, argparse
-from datetime import datetime
-
 import torch
-from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, Dataset
-from transformers import get_linear_schedule_with_warmup
-from datasets import load_dataset
+import torch.nn as nn
+import torch.nn.functional as F
 
-from model import MTT
-
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-
-# ── Config ────────────────────────────────────────────────────────────────────
-SRC_LANG       = "en"          # ngôn ngữ nguồn
-TGT_LANG       = "vi"          # ngôn ngữ đích  (đổi thành "fr", "de", "zh", ...)
-LR_ENCODER     = 2e-5          # encoder lr nhỏ hơn để giữ pretrained
-LR_DECODER     = 1e-4          # decoder + projector + lm_head
-WEIGHT_DECAY   = 0.01
-WARMUP_RATIO   = 0.06
-GRAD_CLIP      = 1.0
-MAX_SRC_LEN    = 128
-MAX_TGT_LEN    = 128
-GRAD_ACCUM     = 4             # effective batch = batch_size × 4
-CHECKPOINT_DIR = "./checkpoints"
-SAVE_EVERY_MIN = 30
-EARLY_STOP     = 3             # dừng nếu val_loss không cải thiện sau N epoch
-RESUME         = None          # vd: "./checkpoints/mtt_best.pt"
+# Dùng Auto classes để tránh import chain dài gây lỗi torchvision
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,   # load mT5 qua Auto thay vì MT5ForConditionalGeneration
+)
+from transformers import T5Tokenizer   # MT5Tokenizer kế thừa T5Tokenizer, tránh import MT5Tokenizer trực tiếp
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
-
-class TranslationDataset(Dataset):
+class MTT(nn.Module):
     """
-    Mỗi sample: {"translation": {"en": "Hello", "vi": "Xin chào"}}
-
-    src_ids : tokenize bằng mmBERT src_tokenizer
-    tgt_ids : tokenize bằng mT5 tgt_tokenizer
-    labels  : tgt_ids shifted left (token tiếp theo cần predict)
-
-    Ví dụ:
-      tgt_ids = [BOS, A, B, C]
-      labels  = [A,   B, C, EOS]   ← shift left 1 vị trí
+    Pipeline hoàn chỉnh:
+        raw src text
+          ──► enc_tokenizer             (AutoTokenizer / mmBERT-small)
+          ──► mmBERT-small encoder      → enc_hidden    (B, src_len, enc_dim=512)
+          ──► NERClassifier             → ner_logits    (B, src_len, 10)
+          ──► nerEmbed(argmax)          → ner_emb       (B, src_len, 512)
+          ──► enc_hidden + ner_emb
+          ──► Projector (Linear)        → projected     (B, src_len, dec_dim=512)
+          ──► mT5-small decoder stack   → dec_hidden    (B, tgt_len, 512)
+          ──► LM head                   → logits        (B, tgt_len, vocab_size)
+          ──► decoded text
     """
-    def __init__(self, hf_split, src_tok, tgt_tok, src_lang, tgt_lang):
-        self.data     = hf_split
-        self.src_tok  = src_tok
-        self.tgt_tok  = tgt_tok
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
 
-    def __len__(self): return len(self.data)
+    NER_LAMBDA  = 0.3
+    MAX_SRC_LEN = 128
+    MAX_TGT_LEN = 128
 
-    def __getitem__(self, idx):
-        pair    = self.data[idx]["translation"]
-        src_txt = pair[self.src_lang]
-        tgt_txt = pair[self.tgt_lang]
+    NER_VOCAB = {
+        'O': 0, 'PERSON': 1, 'ORG': 2, 'LOC': 3, 'GPE': 4,
+        'DATE': 5, 'MONEY': 6, 'PERCENT': 7, 'TIME': 8, 'QUANTITY': 9,
+    }
 
-        # Encode source
-        src_enc = self.src_tok(
-            src_txt, truncation=True, max_length=MAX_SRC_LEN,
-            padding="max_length", return_tensors="pt",
+    def __init__(self):
+        super().__init__()
+
+        # ── 1. Tokenizers ────────────────────────────────────────────────────
+        self.enc_tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
+        self.dec_tokenizer = T5Tokenizer.from_pretrained("google/mt5-small")
+
+        # ── 2. mmBERT-small Encoder ──────────────────────────────────────────
+        self.encoder = AutoModel.from_pretrained("jhu-clsp/mmBERT-small")
+        enc_dim = self.encoder.config.hidden_size   # 512
+
+        # ── 3. NER head ──────────────────────────────────────────────────────
+        self.nerEmbed = nn.Embedding(
+            num_embeddings=len(self.NER_VOCAB),
+            embedding_dim=enc_dim,
         )
+        self.nerClassifier = nn.Linear(enc_dim, len(self.NER_VOCAB))
 
-        # Encode target — mT5 tokenizer
-        with self.tgt_tok.as_target_tokenizer():
-            tgt_enc = self.tgt_tok(
-                tgt_txt, truncation=True, max_length=MAX_TGT_LEN,
-                padding="max_length", return_tensors="pt",
-            )
+        # ── 4. mT5-small – lấy decoder stack + lm_head, bỏ encoder ──────────
+        _mt5    = AutoModelForSeq2SeqLM.from_pretrained("google/mt5-small")
+        dec_dim = _mt5.config.hidden_size   # 512
 
-        tgt_ids = tgt_enc["input_ids"].squeeze(0)   # (T,)
-        tgt_mask= tgt_enc["attention_mask"].squeeze(0)
+        self.decoder = _mt5.decoder         # MT5Stack
+        self.lm_head = _mt5.lm_head         # Linear(512, vocab_size, bias=False)
+        del _mt5                             # giải phóng encoder của mT5
 
-        # Decoder input: [BOS, t0, t1, ..., t_{n-1}]
-        # Labels       : [t0,  t1, ..., t_{n-1}, EOS]   (-100 ở padding)
-        bos_id  = self.tgt_tok.pad_token_id or 0
-        dec_input = torch.cat([torch.tensor([bos_id]), tgt_ids[:-1]])
+        # ── 5. Projector: enc_dim → dec_dim ──────────────────────────────────
+        self.projector = nn.Linear(enc_dim, dec_dim)
 
-        labels  = tgt_ids.clone()
-        labels[tgt_mask == 0] = -100   # ignore padding
+        # Toàn bộ params đều train
+        for p in self.parameters():
+            p.requires_grad = True
 
+    # =========================================================================
+    # INTERNAL: TOKENIZE
+    # =========================================================================
+
+    def _tokenize_src(self, texts: list[str]):
+        """Tokenize raw source text bằng mmBERT tokenizer."""
+        device = next(self.encoder.parameters()).device
+        enc = self.enc_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.MAX_SRC_LEN,
+            return_tensors="pt",
+        )
+        # ModernBERT (jhu-clsp/mmBERT-small) không có token_type_ids
         return {
-            "src_ids":   src_enc["input_ids"].squeeze(0),
-            "src_mask":  src_enc["attention_mask"].squeeze(0),
-            "tgt_ids":   dec_input,
-            "tgt_mask":  tgt_mask,
-            "labels":    labels,
+            "input_ids":      enc["input_ids"].to(device),
+            "attention_mask": enc["attention_mask"].to(device),
         }
 
+    def _tokenize_tgt(self, texts: list[str]):
+        """
+        Tokenize raw target text bằng mT5 tokenizer.
+        Trả về:
+          decoder_input_ids  – shifted right  (BOS = pad_token_id theo T5/mT5 convention)
+          labels             – padding → -100
+        """
+        device = next(self.encoder.parameters()).device
+        enc = self.dec_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.MAX_TGT_LEN,
+            return_tensors="pt",
+        )
+        ids = enc["input_ids"].to(device)
 
-# ── Checkpoint ────────────────────────────────────────────────────────────────
+        # Shift right
+        bos = torch.full(
+            (ids.size(0), 1),
+            self.dec_tokenizer.pad_token_id,
+            dtype=torch.long, device=device,
+        )
+        decoder_input_ids = torch.cat([bos, ids[:, :-1]], dim=1)
 
-class Checkpointer:
-    def __init__(self, save_dir, every_min=30, max_keep=3):
-        os.makedirs(save_dir, exist_ok=True)
-        self.dir, self.interval = save_dir, every_min * 60
-        self.max_keep, self.last_save, self.queue = max_keep, time.time(), []
+        # Labels: padding → -100
+        labels = ids.clone()
+        labels[labels == self.dec_tokenizer.pad_token_id] = -100
 
-    def _state(self, model, opt, sch, epoch, metrics):
-        return dict(epoch=epoch, metrics=metrics, model=model.state_dict(),
-                    optimizer=opt.state_dict(), scheduler=sch.state_dict())
+        return decoder_input_ids, labels
 
-    def _write(self, state, name):
-        path = os.path.join(self.dir, name)
-        torch.save(state, path)
-        return path
+    # =========================================================================
+    # FORWARD
+    # =========================================================================
 
-    def tick(self, model, opt, sch, epoch, step, metrics):
-        if time.time() - self.last_save < self.interval: return
-        path = self._write(self._state(model, opt, sch, epoch, metrics),
-                           f"mtt_ep{epoch}_s{step}_{datetime.now().strftime('%H%M%S')}.pt")
-        self.queue.append(path)
-        if len(self.queue) > self.max_keep:
-            old = self.queue.pop(0)
-            if os.path.exists(old): os.remove(old)
-        self.last_save = time.time()
-        log.info(f"[CKPT] interval → {os.path.basename(path)}")
+    def forward(
+        self,
+        src_texts: list[str],   # raw source strings
+        tgt_texts: list[str],   # raw target strings
+        ner_labels=None,        # (B, src_len) int64 tensor, -100 ở padding, optional
+    ):
+        # Step 1: Tokenize
+        src_enc                   = self._tokenize_src(src_texts)
+        decoder_input_ids, labels = self._tokenize_tgt(tgt_texts)
 
-    def save_best(self, model, opt, sch, epoch, metrics):
-        self._write(self._state(model, opt, sch, epoch, metrics), "mtt_best.pt")
-        log.info(f"[CKPT] best → loss={metrics.get('loss', 0):.4f}")
+        # Step 2: mmBERT-small encode
+        enc_hidden = self.encoder(
+            input_ids=src_enc["input_ids"],
+            attention_mask=src_enc["attention_mask"],
+        ).last_hidden_state                                    # (B, src_len, 512)
 
-    @staticmethod
-    def load(path, model, opt=None, sch=None):
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        if opt: opt.load_state_dict(ckpt["optimizer"])
-        if sch: sch.load_state_dict(ckpt["scheduler"])
-        log.info(f"[CKPT] loaded epoch={ckpt['epoch']} | {ckpt.get('metrics', {})}")
-        return ckpt["epoch"], ckpt.get("metrics", {})
+        # Step 3: NER classify + embed
+        ner_logits = self.nerClassifier(enc_hidden)            # (B, src_len, 10)
+        ner_emb    = self.nerEmbed(ner_logits.argmax(-1))      # (B, src_len, 512)
 
+        # Step 4: Inject NER + Project
+        projected = self.projector(enc_hidden + ner_emb)       # (B, src_len, 512)
 
-# ── Train / Eval — 1 hàm dùng chung ──────────────────────────────────────────
+        # Step 5: mT5 decoder (use_cache=False bắt buộc khi gradient checkpointing bật)
+        dec_hidden = self.decoder(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=projected,
+            encoder_attention_mask=src_enc["attention_mask"],
+            use_cache=False,
+        ).last_hidden_state                                    # (B, tgt_len, 512)
 
-def run_epoch(model, loader, opt, sch, scaler, ckpt, epoch, device, is_train):
-    model.train() if is_train else model.eval()
-    total_loss, steps, t0 = 0.0, 0, time.time()
+        # Step 6: LM head
+        logits = self.lm_head(dec_hidden)                      # (B, tgt_len, vocab)
 
-    with (torch.enable_grad() if is_train else torch.no_grad()):
-        if is_train: opt.zero_grad()
-        for step, batch in enumerate(loader):
-            src_ids  = batch["src_ids"].to(device)
-            src_mask = batch["src_mask"].to(device)
-            tgt_ids  = batch["tgt_ids"].to(device)
-            tgt_mask = batch["tgt_mask"].to(device)
-            labels   = batch["labels"].to(device)
-
-            with autocast(enabled=device.type == "cuda"):
-                out  = model(src_ids, src_mask, tgt_ids, tgt_mask, labels)
-                loss = out["loss"] / (GRAD_ACCUM if is_train else 1)
-
-            if is_train:
-                scaler.scale(loss).backward()
-                if (step + 1) % GRAD_ACCUM == 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                    scaler.step(opt);  scaler.update()
-                    opt.zero_grad();   sch.step()
-                    ckpt.tick(model, opt, sch, epoch, step,
-                              {"loss": loss.item() * GRAD_ACCUM})
-
-            total_loss += loss.item() * (GRAD_ACCUM if is_train else 1)
-            steps += 1
-
-            if is_train and step % 100 == 0:
-                log.info(f"  Ep{epoch} {step:4d}/{len(loader)} | "
-                         f"loss={loss.item()*GRAD_ACCUM:.4f} | {time.time()-t0:.0f}s")
-
-    return {"loss": total_loss / max(steps, 1)}
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main(batch_size):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
-
-    model = MTT().to(device)
-    model.paramsCalc()
-
-    log.info(f"Loading opus-100 ({SRC_LANG}-{TGT_LANG}) ...")
-    raw = load_dataset("Helsinki-NLP/opus-100", f"{SRC_LANG}-{TGT_LANG}")
-    # opus-100 chỉ có train + validation
-    splits = raw["train"].train_test_split(test_size=0.01, seed=42)
-
-    def make_loader(hf_split, shuffle):
-        return DataLoader(
-            TranslationDataset(hf_split, model.src_tokenizer,
-                               model.tgt_tokenizer, SRC_LANG, TGT_LANG),
-            batch_size=batch_size, shuffle=shuffle, pin_memory=True,
+        # Step 7: Generation loss
+        gen_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
         )
 
-    train_loader = make_loader(splits["train"], True)
-    val_loader   = make_loader(splits["test"],  False)
-    log.info(f"  train={len(train_loader)} | val={len(val_loader)} batches")
+        # Step 8: NER loss (nếu có)
+        ner_loss = torch.tensor(0.0, device=enc_hidden.device)
+        if ner_labels is not None:
+            ner_loss = F.cross_entropy(
+                ner_logits.reshape(-1, len(self.NER_VOCAB)),
+                ner_labels.reshape(-1),
+                ignore_index=-100,
+            )
 
-    opt = torch.optim.AdamW([
-        {"params": list(model.encoder.parameters()),  "lr": LR_ENCODER},
-        {"params": (list(model.projector.parameters()) +
-                    list(model.decoder.parameters())  +
-                    list(model.lm_head.parameters())  +
-                    list(model.tgt_embed.parameters())), "lr": LR_DECODER},
-    ], weight_decay=WEIGHT_DECAY)
+        total_loss = gen_loss + self.NER_LAMBDA * ner_loss
+        return total_loss, gen_loss.detach(), ner_loss.detach()
 
-    steps_per_epoch = len(train_loader) // GRAD_ACCUM
-    sch = get_linear_schedule_with_warmup(
-        opt,
-        num_warmup_steps   = int(steps_per_epoch * WARMUP_RATIO),
-        num_training_steps = steps_per_epoch * 5,
-    )
+    # =========================================================================
+    # GENERATE (greedy decode)
+    # =========================================================================
 
-    scaler     = GradScaler(enabled=device.type == "cuda")
-    ckpt       = Checkpointer(CHECKPOINT_DIR, SAVE_EVERY_MIN)
-    best_loss  = float("inf")
-    no_improve = 0
-    start_ep   = 0
+    @torch.no_grad()
+    def generate(self, src_texts: list[str], max_new_tokens: int = 128):
+        """Input: raw string list → Output: decoded string list."""
+        device = next(self.encoder.parameters()).device
+        B      = len(src_texts)
 
-    if RESUME and os.path.exists(RESUME):
-        start_ep, m = Checkpointer.load(RESUME, model, opt, sch)
-        model = model.to(device)
-        best_loss = m.get("loss", float("inf"))
-        start_ep += 1
+        # Tokenize + Encode
+        src_enc    = self._tokenize_src(src_texts)
+        enc_hidden = self.encoder(
+            input_ids=src_enc["input_ids"],
+            attention_mask=src_enc["attention_mask"],
+        ).last_hidden_state
 
-    NUM_EPOCHS = 5
-    log.info(f"Training {SRC_LANG}→{TGT_LANG} | "
-             f"{NUM_EPOCHS} epochs | early stop={EARLY_STOP} | "
-             f"effective batch={batch_size}×{GRAD_ACCUM}={batch_size*GRAD_ACCUM}")
-    history = []
+        # NER + Project
+        ner_emb   = self.nerEmbed(self.nerClassifier(enc_hidden).argmax(-1))
+        projected = self.projector(enc_hidden + ner_emb)
 
-    try:
-        for epoch in range(start_ep, NUM_EPOCHS):
-            t0      = time.time()
-            train_m = run_epoch(model, train_loader, opt, sch, scaler, ckpt, epoch, device, True)
-            val_m   = run_epoch(model, val_loader,   opt, sch, scaler, ckpt, epoch, device, False)
+        # Greedy decode với KV cache
+        dec_ids = torch.full(
+            (B, 1), self.dec_tokenizer.pad_token_id,
+            dtype=torch.long, device=device,
+        )
+        past_kv = None
 
-            history.append({"epoch": epoch, "train": train_m, "val": val_m})
-            log.info(f"\nEpoch {epoch} | {time.time()-t0:.0f}s\n"
-                     f"  train loss={train_m['loss']:.4f}\n"
-                     f"  val   loss={val_m['loss']:.4f}\n")
+        for _ in range(max_new_tokens):
+            cur_input = dec_ids if past_kv is None else dec_ids[:, -1:]
+            dec_out   = self.decoder(
+                input_ids=cur_input,
+                encoder_hidden_states=projected,
+                encoder_attention_mask=src_enc["attention_mask"],
+                past_key_values=past_kv,
+                use_cache=True,
+            )
+            past_kv  = dec_out.past_key_values
+            next_tok = self.lm_head(dec_out.last_hidden_state[:, -1]).argmax(-1, keepdim=True)
+            dec_ids  = torch.cat([dec_ids, next_tok], dim=1)
+            if (next_tok == self.dec_tokenizer.eos_token_id).all():
+                break
 
-            if val_m["loss"] < best_loss:
-                best_loss  = val_m["loss"]
-                no_improve = 0
-                ckpt.save_best(model, opt, sch, epoch, val_m)
-            else:
-                no_improve += 1
-                log.info(f"  [Early stop] không cải thiện {no_improve}/{EARLY_STOP}")
-                if no_improve >= EARLY_STOP:
-                    log.info(f"  [Early stop] dừng tại epoch {epoch}")
-                    break
+        return self.dec_tokenizer.batch_decode(dec_ids[:, 1:], skip_special_tokens=True)
 
-    except KeyboardInterrupt:
-        log.info("\n[STOP] Ctrl+C — lưu checkpoint ...")
-        ckpt._write(ckpt._state(model, opt, sch, epoch, {}),
-                    f"mtt_interrupted_ep{epoch}.pt")
+    # =========================================================================
+    # UTILS
+    # =========================================================================
 
-    with open(os.path.join(CHECKPOINT_DIR, "summary.json"), "w") as f:
-        json.dump({"best_val_loss": best_loss, "history": history,
-                   "src_lang": SRC_LANG, "tgt_lang": TGT_LANG}, f, indent=2)
+    def paramsCalc(self):
+        parts = {
+            "encoder"      : self.encoder,
+            "nerEmbed"     : self.nerEmbed,
+            "nerClassifier": self.nerClassifier,
+            "projector"    : self.projector,
+            "decoder"      : self.decoder,
+            "lm_head"      : self.lm_head,
+        }
+        total = 0
+        for name, module in parts.items():
+            n = sum(p.numel() for p in module.parameters())
+            total += n
+            print(f"  {name:<16}: {n:>12,}")
+        print(f"  {'TOTAL':<16}: {total:>12,}")
+
+    def enable_gradient_checkpointing(self):
+        if hasattr(self.encoder, "gradient_checkpointing_enable"):
+            self.encoder.gradient_checkpointing_enable()
+        if hasattr(self.decoder, "gradient_checkpointing_enable"):
+            self.decoder.gradient_checkpointing_enable()
 
 
+# ─── Quick test khi chạy trực tiếp ───────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=8)
-    main(parser.parse_args().batch_size)
+    print("[TEST] Khởi tạo MTT model…")
+    model = MTT()
+    print("[TEST] Param count:")
+    model.paramsCalc()
+
+    print("\n[TEST] Forward pass với dummy data…")
+    loss, gen, ner = model(
+        src_texts=["The president of France visited Vietnam."],
+        tgt_texts=["Tổng thống Pháp đã thăm Việt Nam."],
+    )
+    print(f"  total_loss={loss.item():.4f}  gen={gen.item():.4f}  ner={ner.item():.4f}")
+
+    print("\n[TEST] Generate…")
+    out = model.generate(["Hello world, this is a test."])
+    print(f"  output: {out}")
+
+    print("\n[OK] model.py chạy thành công!")
