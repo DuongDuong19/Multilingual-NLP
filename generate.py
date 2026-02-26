@@ -1,70 +1,64 @@
 """
-generate.py  —  dịch câu bằng tay
-
-  python generate.py                                     # interactive
-  python generate.py --text "Hello, how are you?"
-  python generate.py --text "..." --src en --tgt vi
-  python generate.py --ckpt ./checkpoints/mtt_best.pt
+generate.py  –  Load checkpoint mới nhất và chạy inference.
 """
 
-import argparse, os
+import os
 import torch
 from model import MTT
 
-
-def translate(model, text, device, max_new_tokens=128):
-    src_enc = model.src_tokenizer(
-        text, return_tensors="pt", truncation=True, max_length=128,
-        padding=True,
-    )
-    src_ids  = src_enc["input_ids"].to(device)
-    src_mask = src_enc["attention_mask"].to(device)
-    return model.generate(src_ids, src_mask, max_new_tokens=max_new_tokens)
+CKPT_DIR = "checkpoints"
+DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt",           default="./checkpoints/mtt_best.pt")
-    parser.add_argument("--text",           default=None)
-    parser.add_argument("--max_new_tokens", type=int, default=128)
-    parser.add_argument("--device",         default="auto")
-    args = parser.parse_args()
-
-    device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
-              if args.device == "auto" else torch.device(args.device))
-
-    model = MTT().to(device)
+def load_model():
+    print("[INFO] Khởi tạo model…")
+    model = MTT().to(DEVICE)
     model.eval()
 
-    if os.path.exists(args.ckpt):
-        ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        m = ckpt.get("metrics", {})
-        print(f"Loaded: {args.ckpt}"
-              + (f"  (epoch={ckpt['epoch']} | loss={m.get('loss','?'):.4f})" if m else ""))
+    path = None
+    if os.path.isdir(CKPT_DIR):
+        pts = sorted(
+            [f for f in os.listdir(CKPT_DIR) if f.endswith(".pt")],
+            key=lambda f: int(f.split("step")[1].split(".")[0]) if "step" in f else -1,
+        )
+        if pts:
+            path = os.path.join(CKPT_DIR, pts[-1])
+
+    if path:
+        ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(ckpt["model_state"])
+        print(f"[INFO] Loaded: {path}  (epoch={ckpt.get('epoch','?')}, step={ckpt.get('step','?')})")
     else:
-        print(f"[WARN] Không tìm thấy {args.ckpt} — dùng random weights")
+        print("[WARN] Không tìm thấy checkpoint – dùng weights random.")
 
-    print(f"Device: {device}\n")
+    return model
 
-    if args.text:
-        result = translate(model, args.text, device, args.max_new_tokens)
-        print(f"Input : {args.text}")
-        print(f"Output: {result}")
-        return
 
-    print("Interactive mode — Ctrl+C hoặc 'q' để thoát\n")
-    while True:
-        try:
-            text = input(">>> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!"); break
-        if not text: continue
-        if text.lower() in {"q", "quit", "exit"}: print("Bye!"); break
-
-        result = translate(model, text, device, args.max_new_tokens)
-        print(f"    → {result}\n")
+def run(
+    texts: list[str],
+    max_new_tokens: int       = 64,
+    repetition_penalty: float = 1.5,
+):
+    model = load_model()
+    print("\n" + "═" * 60)
+    with torch.no_grad():
+        outputs = model.generate(
+            texts,
+            max_new_tokens=max_new_tokens,
+            repetition_penalty=repetition_penalty,
+        )
+    for src, out in zip(texts, outputs):
+        print(f"  SRC : {src}")
+        print(f"  OUT : {out if out.strip() else '(empty – model cần train thêm)'}")
+        print()
+    print("═" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    test_inputs = [
+        "The president of France visited Vietnam last week.",
+        "Apple Inc. reported record revenue of $120 billion in Q4.",
+        "Three people were injured in a car accident near Berlin.",
+        "The new policy affects 50 percent of the population.",
+    ]
+    run(test_inputs)

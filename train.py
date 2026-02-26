@@ -1,274 +1,338 @@
 """
-train.py  —  python train.py [--batch_size N]
-Dataset : Helsinki-NLP/opus-100  (100 cặp ngôn ngữ)
-Dừng    : Ctrl+C, checkpoint tự lưu.
+train.py  –  Train MTT 5 epochs, checkpoint mỗi 30 phút.
+Tối ưu cho GPU 6GB:
+  - bf16 (stable hơn fp16, không bị overflow → NaN)
+  - 8-bit AdamW (bitsandbytes) → tiết kiệm ~2.4GB VRAM
+  - gradient checkpointing
+  - NaN guard: phát hiện NaN loss → skip step, không để lan
+
+pip install bitsandbytes
+
+Chỉnh nếu OOM: giảm MAX_SRC_LEN / MAX_TGT_LEN trong model.py (128 → 64)
 """
 
-import os, time, json, logging, argparse
-from datetime import datetime
+import os, time, signal, math
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
-from torch.cuda.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, Dataset
-from transformers import get_linear_schedule_with_warmup
-from datasets import load_dataset
+from torch.utils.data import Dataset, DataLoader
+from transformers import get_cosine_schedule_with_warmup
+
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    print("[WARN] bitsandbytes chưa cài → pip install bitsandbytes\n")
 
 from model import MTT
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
+# ════════════════════════════════════════════════════════════
+BATCH_SIZE = 1
+# ════════════════════════════════════════════════════════════
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SRC_LANG       = "en"          # ngôn ngữ nguồn
-TGT_LANG       = "vi"          # ngôn ngữ đích  (đổi thành "fr", "de", "zh", ...)
-LR_ENCODER     = 2e-5          # encoder lr nhỏ hơn để giữ pretrained
-LR_DECODER     = 1e-4          # decoder + projector + lm_head
-WEIGHT_DECAY   = 0.01
-WARMUP_RATIO   = 0.06
-GRAD_CLIP      = 1.0
-MAX_SRC_LEN    = 128
-MAX_TGT_LEN    = 128
-GRAD_ACCUM     = 4             # effective batch = batch_size × 4
-CHECKPOINT_DIR = "./checkpoints"
-SAVE_EVERY_MIN = 30
-EARLY_STOP     = 3             # dừng nếu val_loss không cải thiện sau N epoch
-RESUME         = None          # vd: "./checkpoints/mtt_best.pt"
+GRAD_ACCUM    = 8        # effective batch = 8
+LR            = 5e-5     # thấp hơn (3e-4 quá cao → loss diverge)
+WEIGHT_DECAY  = 0.01
+NUM_EPOCHS    = 50
+WARMUP_RATIO  = 0.1      # warmup dài hơn để khởi động ổn định
+CKPT_DIR      = "checkpoints"
+CKPT_INTERVAL = 30 * 60
+LOG_EVERY     = 20
+NUM_WORKERS   = 0
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# bf16 ổn định hơn fp16 (không overflow), dùng nếu GPU hỗ trợ
+USE_BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+USE_FP16 = torch.cuda.is_available() and not USE_BF16
+DTYPE    = torch.bfloat16 if USE_BF16 else torch.float16
+
+print(f"[INFO] Precision: {'bf16' if USE_BF16 else 'fp16' if USE_FP16 else 'fp32'}")
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+# ─── Dataset ─────────────────────────────────────────────────────────────────
 
-class TranslationDataset(Dataset):
-    """
-    Mỗi sample: {"translation": {"en": "Hello", "vi": "Xin chào"}}
+class TextPairDataset(Dataset):
+    def __init__(self):
+        # ── THAY DATA THỰC VÀO ĐÂY ──────────────────────────────────────────
+        self.pairs = [
+            ("The president of France visited Vietnam last week.",
+             "Tổng thống Pháp đã thăm Việt Nam tuần trước."),
+            ("Apple Inc. reported record revenue in Q4 2024.",
+             "Apple Inc. báo cáo doanh thu kỷ lục trong Q4 2024."),
+            ("The river flooded three towns in southern Germany.",
+             "Dòng sông đã làm ngập lụt ba thị trấn ở miền nam nước Đức."),
+        ] * 300
+        # ────────────────────────────────────────────────────────────────────
 
-    src_ids : tokenize bằng mmBERT src_tokenizer
-    tgt_ids : tokenize bằng mT5 tgt_tokenizer
-    labels  : tgt_ids shifted left (token tiếp theo cần predict)
-
-    Ví dụ:
-      tgt_ids = [BOS, A, B, C]
-      labels  = [A,   B, C, EOS]   ← shift left 1 vị trí
-    """
-    def __init__(self, hf_split, src_tok, tgt_tok, src_lang, tgt_lang):
-        self.data     = hf_split
-        self.src_tok  = src_tok
-        self.tgt_tok  = tgt_tok
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
-
-    def __len__(self): return len(self.data)
+    def __len__(self):
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        pair    = self.data[idx]["translation"]
-        src_txt = pair[self.src_lang]
-        tgt_txt = pair[self.tgt_lang]
-
-        # Encode source
-        src_enc = self.src_tok(
-            src_txt, truncation=True, max_length=MAX_SRC_LEN,
-            padding="max_length", return_tensors="pt",
-        )
-
-        # Encode target — mT5 tokenizer
-        with self.tgt_tok.as_target_tokenizer():
-            tgt_enc = self.tgt_tok(
-                tgt_txt, truncation=True, max_length=MAX_TGT_LEN,
-                padding="max_length", return_tensors="pt",
-            )
-
-        tgt_ids = tgt_enc["input_ids"].squeeze(0)   # (T,)
-        tgt_mask= tgt_enc["attention_mask"].squeeze(0)
-
-        # Decoder input: [BOS, t0, t1, ..., t_{n-1}]
-        # Labels       : [t0,  t1, ..., t_{n-1}, EOS]   (-100 ở padding)
-        bos_id  = self.tgt_tok.pad_token_id or 0
-        dec_input = torch.cat([torch.tensor([bos_id]), tgt_ids[:-1]])
-
-        labels  = tgt_ids.clone()
-        labels[tgt_mask == 0] = -100   # ignore padding
-
-        return {
-            "src_ids":   src_enc["input_ids"].squeeze(0),
-            "src_mask":  src_enc["attention_mask"].squeeze(0),
-            "tgt_ids":   dec_input,
-            "tgt_mask":  tgt_mask,
-            "labels":    labels,
-        }
+        return self.pairs[idx]
 
 
-# ── Checkpoint ────────────────────────────────────────────────────────────────
-
-class Checkpointer:
-    def __init__(self, save_dir, every_min=30, max_keep=3):
-        os.makedirs(save_dir, exist_ok=True)
-        self.dir, self.interval = save_dir, every_min * 60
-        self.max_keep, self.last_save, self.queue = max_keep, time.time(), []
-
-    def _state(self, model, opt, sch, epoch, metrics):
-        return dict(epoch=epoch, metrics=metrics, model=model.state_dict(),
-                    optimizer=opt.state_dict(), scheduler=sch.state_dict())
-
-    def _write(self, state, name):
-        path = os.path.join(self.dir, name)
-        torch.save(state, path)
-        return path
-
-    def tick(self, model, opt, sch, epoch, step, metrics):
-        if time.time() - self.last_save < self.interval: return
-        path = self._write(self._state(model, opt, sch, epoch, metrics),
-                           f"mtt_ep{epoch}_s{step}_{datetime.now().strftime('%H%M%S')}.pt")
-        self.queue.append(path)
-        if len(self.queue) > self.max_keep:
-            old = self.queue.pop(0)
-            if os.path.exists(old): os.remove(old)
-        self.last_save = time.time()
-        log.info(f"[CKPT] interval → {os.path.basename(path)}")
-
-    def save_best(self, model, opt, sch, epoch, metrics):
-        self._write(self._state(model, opt, sch, epoch, metrics), "mtt_best.pt")
-        log.info(f"[CKPT] best → loss={metrics.get('loss', 0):.4f}")
-
-    @staticmethod
-    def load(path, model, opt=None, sch=None):
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        if opt: opt.load_state_dict(ckpt["optimizer"])
-        if sch: sch.load_state_dict(ckpt["scheduler"])
-        log.info(f"[CKPT] loaded epoch={ckpt['epoch']} | {ckpt.get('metrics', {})}")
-        return ckpt["epoch"], ckpt.get("metrics", {})
+def collate(batch):
+    has_ner = len(batch[0]) == 3
+    srcs = [b[0] for b in batch]
+    tgts = [b[1] for b in batch]
+    ner  = [b[2] for b in batch] if has_ner else None
+    return srcs, tgts, ner
 
 
-# ── Train / Eval — 1 hàm dùng chung ──────────────────────────────────────────
+# ─── Checkpoint ──────────────────────────────────────────────────────────────
 
-def run_epoch(model, loader, opt, sch, scaler, ckpt, epoch, device, is_train):
-    model.train() if is_train else model.eval()
-    total_loss, steps, t0 = 0.0, 0, time.time()
-
-    with (torch.enable_grad() if is_train else torch.no_grad()):
-        if is_train: opt.zero_grad()
-        for step, batch in enumerate(loader):
-            src_ids  = batch["src_ids"].to(device)
-            src_mask = batch["src_mask"].to(device)
-            tgt_ids  = batch["tgt_ids"].to(device)
-            tgt_mask = batch["tgt_mask"].to(device)
-            labels   = batch["labels"].to(device)
-
-            with autocast(enabled=device.type == "cuda"):
-                out  = model(src_ids, src_mask, tgt_ids, tgt_mask, labels)
-                loss = out["loss"] / (GRAD_ACCUM if is_train else 1)
-
-            if is_train:
-                scaler.scale(loss).backward()
-                if (step + 1) % GRAD_ACCUM == 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                    scaler.step(opt);  scaler.update()
-                    opt.zero_grad();   sch.step()
-                    ckpt.tick(model, opt, sch, epoch, step,
-                              {"loss": loss.item() * GRAD_ACCUM})
-
-            total_loss += loss.item() * (GRAD_ACCUM if is_train else 1)
-            steps += 1
-
-            if is_train and step % 100 == 0:
-                log.info(f"  Ep{epoch} {step:4d}/{len(loader)} | "
-                         f"loss={loss.item()*GRAD_ACCUM:.4f} | {time.time()-t0:.0f}s")
-
-    return {"loss": total_loss / max(steps, 1)}
+def save_ckpt(model, optimizer, scheduler, epoch, step, loss):
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    path = os.path.join(CKPT_DIR, f"ckpt_ep{epoch}_step{step}.pt")
+    torch.save({
+        "epoch"          : epoch,
+        "step"           : step,
+        "model_state"    : model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "loss"           : loss,
+    }, path)
+    print(f"\n[CKPT] ✓ Saved → {path}  (loss={loss:.4f})\n")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def load_latest_ckpt(model, optimizer, scheduler):
+    if not os.path.isdir(CKPT_DIR):
+        return 0, 0
+    pts = [f for f in os.listdir(CKPT_DIR) if f.endswith(".pt")]
+    if not pts:
+        return 0, 0
+    pts.sort(key=lambda f: int(f.split("step")[1].split(".")[0]) if "step" in f else -1)
+    path = os.path.join(CKPT_DIR, pts[-1])
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
 
-def main(batch_size):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
+    model_key = "model_state"     if "model_state"     in ckpt else "model"
+    opt_key   = "optimizer_state" if "optimizer_state" in ckpt else "optimizer"
+    sched_key = "scheduler_state" if "scheduler_state" in ckpt else "scheduler"
 
-    model = MTT().to(device)
+    if model_key not in ckpt:
+        print(f"[WARN] Checkpoint {path} cấu trúc không nhận ra, bỏ qua.")
+        return 0, 0
+
+    model.load_state_dict(ckpt[model_key])
+    if opt_key   in ckpt: optimizer.load_state_dict(ckpt[opt_key])
+    if sched_key in ckpt: scheduler.load_state_dict(ckpt[sched_key])
+
+    epoch = ckpt.get("epoch", 0)
+    step  = ckpt.get("step",  0)
+    loss  = ckpt.get("loss",  float("nan"))
+    print(f"[CKPT] Resumed {path}  (epoch={epoch}, step={step}, loss={loss:.4f})")
+    return epoch, step
+
+
+# ─── Optimizer ───────────────────────────────────────────────────────────────
+
+def make_optimizer(model):
+    no_decay = {"bias", "LayerNorm.weight"}
+    params = [
+        {"params": [p for n, p in model.named_parameters()
+                    if p.requires_grad and not any(nd in n for nd in no_decay)],
+         "weight_decay": WEIGHT_DECAY},
+        {"params": [p for n, p in model.named_parameters()
+                    if p.requires_grad and     any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+    ]
+    if HAS_BNB:
+        print("[INFO] Dùng 8-bit AdamW (bitsandbytes)")
+        return bnb.optim.AdamW8bit(params, lr=LR)
+    else:
+        return torch.optim.AdamW(params, lr=LR)
+
+
+# ─── Train ───────────────────────────────────────────────────────────────────
+
+def train():
+    stop = False
+    def on_sigint(sig, frame):
+        nonlocal stop
+        print("\n[INFO] Ctrl+C – dừng sau step hiện tại và lưu checkpoint…")
+        stop = True
+    signal.signal(signal.SIGINT, on_sigint)
+
+    # Model
+    print("[INFO] Khởi tạo model…")
+    model = MTT().to(DEVICE)
+    model.enable_gradient_checkpointing()
+    print("[INFO] Param count:")
     model.paramsCalc()
 
-    log.info(f"Loading opus-100 ({SRC_LANG}-{TGT_LANG}) ...")
-    raw = load_dataset("Helsinki-NLP/opus-100", f"{SRC_LANG}-{TGT_LANG}")
-    # opus-100 chỉ có train + validation
-    splits = raw["train"].train_test_split(test_size=0.01, seed=42)
+    # GradScaler chỉ dùng cho fp16 (bf16 không cần scaler)
+    use_scaler = USE_FP16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler, init_scale=256)
 
-    def make_loader(hf_split, shuffle):
-        return DataLoader(
-            TranslationDataset(hf_split, model.src_tokenizer,
-                               model.tgt_tokenizer, SRC_LANG, TGT_LANG),
-            batch_size=batch_size, shuffle=shuffle, pin_memory=True,
-        )
+    # Optimizer
+    optimizer = make_optimizer(model)
 
-    train_loader = make_loader(splits["train"], True)
-    val_loader   = make_loader(splits["test"],  False)
-    log.info(f"  train={len(train_loader)} | val={len(val_loader)} batches")
-
-    opt = torch.optim.AdamW([
-        {"params": list(model.encoder.parameters()),  "lr": LR_ENCODER},
-        {"params": (list(model.projector.parameters()) +
-                    list(model.decoder.parameters())  +
-                    list(model.lm_head.parameters())  +
-                    list(model.tgt_embed.parameters())), "lr": LR_DECODER},
-    ], weight_decay=WEIGHT_DECAY)
-
-    steps_per_epoch = len(train_loader) // GRAD_ACCUM
-    sch = get_linear_schedule_with_warmup(
-        opt,
-        num_warmup_steps   = int(steps_per_epoch * WARMUP_RATIO),
-        num_training_steps = steps_per_epoch * 5,
+    # Dataset & loader
+    dataset = TextPairDataset()
+    loader  = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
+        collate_fn=collate,
+        drop_last=True,
     )
 
-    scaler     = GradScaler(enabled=device.type == "cuda")
-    ckpt       = Checkpointer(CHECKPOINT_DIR, SAVE_EVERY_MIN)
-    best_loss  = float("inf")
-    no_improve = 0
-    start_ep   = 0
+    # Scheduler
+    steps_per_epoch = math.ceil(len(dataset) / (BATCH_SIZE * GRAD_ACCUM))
+    total_steps     = steps_per_epoch * NUM_EPOCHS
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * WARMUP_RATIO),
+        num_training_steps=total_steps,
+    )
 
-    if RESUME and os.path.exists(RESUME):
-        start_ep, m = Checkpointer.load(RESUME, model, opt, sch)
-        model = model.to(device)
-        best_loss = m.get("loss", float("inf"))
-        start_ep += 1
+    # Resume
+    start_epoch, global_step = load_latest_ckpt(model, optimizer, scheduler)
 
-    NUM_EPOCHS = 5
-    log.info(f"Training {SRC_LANG}→{TGT_LANG} | "
-             f"{NUM_EPOCHS} epochs | early stop={EARLY_STOP} | "
-             f"effective batch={batch_size}×{GRAD_ACCUM}={batch_size*GRAD_ACCUM}")
-    history = []
+    amp_ctx = torch.amp.autocast("cuda", dtype=DTYPE, enabled=(USE_BF16 or USE_FP16))
 
-    try:
-        for epoch in range(start_ep, NUM_EPOCHS):
-            t0      = time.time()
-            train_m = run_epoch(model, train_loader, opt, sch, scaler, ckpt, epoch, device, True)
-            val_m   = run_epoch(model, val_loader,   opt, sch, scaler, ckpt, epoch, device, False)
+    print(f"\n[INFO] Training {NUM_EPOCHS} epochs | "
+          f"batch={BATCH_SIZE} | accum={GRAD_ACCUM} | effective={BATCH_SIZE*GRAD_ACCUM} | "
+          f"lr={LR} | device={DEVICE} | "
+          f"{'bf16' if USE_BF16 else 'fp16' if USE_FP16 else 'fp32'} | "
+          f"8bit={HAS_BNB}\n")
 
-            history.append({"epoch": epoch, "train": train_m, "val": val_m})
-            log.info(f"\nEpoch {epoch} | {time.time()-t0:.0f}s\n"
-                     f"  train loss={train_m['loss']:.4f}\n"
-                     f"  val   loss={val_m['loss']:.4f}\n")
+    last_ckpt_time = time.time()
+    last_loss      = float("nan")
+    nan_count      = 0       # đếm NaN liên tiếp để cảnh báo
+    last_gen_loss  = 0.0
+    last_ner_loss  = 0.0
 
-            if val_m["loss"] < best_loss:
-                best_loss  = val_m["loss"]
-                no_improve = 0
-                ckpt.save_best(model, opt, sch, epoch, val_m)
+    if start_epoch >= NUM_EPOCHS:
+        print(f"[INFO] Checkpoint đã train đủ {NUM_EPOCHS} epochs.")
+        print(f"[INFO] Tăng NUM_EPOCHS > {NUM_EPOCHS} để train thêm, hoặc xóa checkpoints/ để train lại.")
+        return
+
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        if stop:
+            break
+
+        model.train()
+        epoch_loss, epoch_valid_steps = 0.0, 0
+        running_loss, micro           = 0.0, 0
+        optimizer.zero_grad(set_to_none=True)
+
+        for srcs, tgts, ner_labels in loader:
+            if stop:
+                break
+
+            # NER labels → tensor nếu có
+            ner_t = None
+            if ner_labels is not None:
+                src_len = model.MAX_SRC_LEN
+                padded  = [(seq + [-100] * src_len)[:src_len] for seq in ner_labels]
+                ner_t   = torch.tensor(padded, dtype=torch.long, device=DEVICE)
+
+            # ── Forward ──────────────────────────────────────────────────────
+            with amp_ctx:
+                total_loss, gen_loss, ner_loss = model(
+                    src_texts=srcs,
+                    tgt_texts=tgts,
+                    ner_labels=ner_t,
+                )
+
+            # ── NaN guard: bỏ qua batch này, không backward ──────────────────
+            if not torch.isfinite(total_loss):
+                nan_count += 1
+                if nan_count % 10 == 1:
+                    print(f"  [WARN] NaN/Inf loss tại micro-step, skip "
+                          f"(tổng {nan_count} lần). "
+                          f"gen={gen_loss.item():.2f}")
+                optimizer.zero_grad(set_to_none=True)
+                micro = 0   # reset accum để không step với gradient rác
+                continue
+            nan_count = 0   # reset nếu loss hợp lệ trở lại
+
+            # ── Backward ─────────────────────────────────────────────────────
+            loss = total_loss / GRAD_ACCUM
+            if use_scaler:
+                scaler.scale(loss).backward()
             else:
-                no_improve += 1
-                log.info(f"  [Early stop] không cải thiện {no_improve}/{EARLY_STOP}")
-                if no_improve >= EARLY_STOP:
-                    log.info(f"  [Early stop] dừng tại epoch {epoch}")
-                    break
+                loss.backward()
 
-    except KeyboardInterrupt:
-        log.info("\n[STOP] Ctrl+C — lưu checkpoint ...")
-        ckpt._write(ckpt._state(model, opt, sch, epoch, {}),
-                    f"mtt_interrupted_ep{epoch}.pt")
+            running_loss  += total_loss.item()
+            last_gen_loss  = gen_loss.item()
+            last_ner_loss  = ner_loss.item()
+            micro         += 1
 
-    with open(os.path.join(CHECKPOINT_DIR, "summary.json"), "w") as f:
-        json.dump({"best_val_loss": best_loss, "history": history,
-                   "src_lang": SRC_LANG, "tgt_lang": TGT_LANG}, f, indent=2)
+            # ── Optimizer step ───────────────────────────────────────────────
+            if micro % GRAD_ACCUM == 0:
+                if use_scaler:
+                    scaler.unscale_(optimizer)
+
+                # Clip gradient – quan trọng để tránh diverge
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
+
+                # Bỏ qua nếu gradient vẫn NaN sau clip
+                if not torch.isfinite(grad_norm):
+                    print(f"  [WARN] Gradient NaN/Inf (norm={grad_norm:.2f}), skip optimizer step")
+                    optimizer.zero_grad(set_to_none=True)
+                    if use_scaler:
+                        scaler.update()
+                    micro        = 0
+                    running_loss = 0.0
+                    continue
+
+                if use_scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step        += 1
+                epoch_valid_steps  += 1
+                avg                 = running_loss / GRAD_ACCUM
+                epoch_loss         += avg
+                last_loss           = avg
+                running_loss        = 0.0
+                micro               = 0
+
+                # Log
+                if global_step % LOG_EVERY == 0:
+                    lr_now = scheduler.get_last_lr()[0]
+                    vram   = torch.cuda.memory_allocated() / 1e9
+                    print(
+                        f"  ep {epoch+1}/{NUM_EPOCHS}  "
+                        f"step {global_step:>6d}  "
+                        f"loss={avg:.4f}  "
+                        f"gen={last_gen_loss:.4f}  "
+                        f"ner={last_ner_loss:.4f}  "
+                        f"lr={lr_now:.2e}  "
+                        f"vram={vram:.2f}GB"
+                    )
+
+                # Checkpoint mỗi 30 phút
+                if time.time() - last_ckpt_time >= CKPT_INTERVAL:
+                    save_ckpt(model, optimizer, scheduler, epoch, global_step, last_loss)
+                    last_ckpt_time = time.time()
+
+        # Cuối epoch
+        if epoch_valid_steps > 0:
+            avg_ep = epoch_loss / epoch_valid_steps
+            print(f"\n{'─'*60}")
+            print(f"  ✓ Epoch {epoch+1}/{NUM_EPOCHS} done  |  avg_loss={avg_ep:.4f}  |  valid_steps={epoch_valid_steps}")
+            print(f"{'─'*60}\n")
+            save_ckpt(model, optimizer, scheduler, epoch + 1, global_step, avg_ep)
+        else:
+            print(f"  [WARN] Epoch {epoch+1} không có valid step nào (toàn NaN)!")
+        last_ckpt_time = time.time()
+
+    print("[INFO] Training hoàn tất.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=8)
-    main(parser.parse_args().batch_size)
+    train()
