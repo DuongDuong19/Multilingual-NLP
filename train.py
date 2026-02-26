@@ -1,274 +1,635 @@
 """
-train.py  —  python train.py [--batch_size N]
-Dataset : Helsinki-NLP/opus-100  (100 cặp ngôn ngữ)
-Dừng    : Ctrl+C, checkpoint tự lưu.
+MTT Training Script
+────────────────────────────────────────────────────────────────
+One cycle = 800 train steps + 200 test steps = 1000 total
+Each step = one monolingual batch (one language per batch, always)
+After each cycle: LR auto-adjusted based on avg test loss
+Runs forever — press Ctrl+C to stop safely
+Checkpoint every 30 minutes + end of every cycle
+All language pairs fetched automatically from OPUS-100
+
+Install:
+    pip install torch datasets sentencepiece transformers
 """
 
-import os, time, json, logging, argparse
-from datetime import datetime
+import math
+import os
+import random
+import signal
+import time
 
+import spacy
 import torch
-from torch.cuda.amp import autocast, GradScaler
+import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from transformers import get_linear_schedule_with_warmup
-from datasets import load_dataset
+from torch.amp import GradScaler, autocast
 
 from model import MTT
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s | %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-SRC_LANG       = "en"          # ngôn ngữ nguồn
-TGT_LANG       = "vi"          # ngôn ngữ đích  (đổi thành "fr", "de", "zh", ...)
-LR_ENCODER     = 2e-5          # encoder lr nhỏ hơn để giữ pretrained
-LR_DECODER     = 1e-4          # decoder + projector + lm_head
-WEIGHT_DECAY   = 0.01
-WARMUP_RATIO   = 0.06
-GRAD_CLIP      = 1.0
-MAX_SRC_LEN    = 128
-MAX_TGT_LEN    = 128
-GRAD_ACCUM     = 4             # effective batch = batch_size × 4
-CHECKPOINT_DIR = "./checkpoints"
-SAVE_EVERY_MIN = 30
-EARLY_STOP     = 3             # dừng nếu val_loss không cải thiện sau N epoch
-RESUME         = None          # vd: "./checkpoints/mtt_best.pt"
+# ── spaCy label → nerVocab key ────────────────────────────────────────────────
+_SPACY_TO_NER = {
+    "PERSON": "PERSON", "PER": "PERSON",
+    "ORG": "ORG", "LOC": "LOC", "GPE": "GPE",
+    "DATE": "DATE", "MONEY": "MONEY", "PERCENT": "PERCENT",
+    "TIME": "TIME", "QUANTITY": "QUANTITY", "CARDINAL": "QUANTITY",
+}
 
 
-# ── Dataset ───────────────────────────────────────────────────────────────────
+def _load_spacy(model_name: str = "xx_ent_wiki_sm"):
+    """Load spaCy multilingual NER model (disable unneeded pipes)."""
+    try:
+        nlp = spacy.load(model_name, disable=["tagger", "parser", "senter", "lemmatizer"])
+        print(f"  [NER ]  spaCy '{model_name}' loaded.")
+        return nlp
+    except OSError:
+        print(f"  [NER ]  Model '{model_name}' not found. Run:")
+        print(f"          python -m spacy download {model_name}")
+        raise
 
-class TranslationDataset(Dataset):
+
+def _extract_ner_tags(
+    src_texts  : list[str],
+    target_lang: str,
+    nlp,
+    tokenizer,
+    ner_vocab  : dict,
+    max_length : int = 128,
+    device     : str = "cpu",
+) -> torch.Tensor:
     """
-    Mỗi sample: {"translation": {"en": "Hello", "vi": "Xin chào"}}
+    1. Chạy spaCy NER trên src_texts (nguyên văn, không có prefix).
+    2. Tokenize tagged_src (có prefix <2lang>) với return_offsets_mapping=True.
+    3. Dùng offset để map từng subword → entity tag id.
 
-    src_ids : tokenize bằng mmBERT src_tokenizer
-    tgt_ids : tokenize bằng mT5 tgt_tokenizer
-    labels  : tgt_ids shifted left (token tiếp theo cần predict)
-
-    Ví dụ:
-      tgt_ids = [BOS, A, B, C]
-      labels  = [A,   B, C, EOS]   ← shift left 1 vị trí
+    Returns: LongTensor [B, seq_len]
+      -100  → special token / prefix token / padding  (ignored by cross_entropy)
+         0  → 'O' (mặc định)
+      1..N  → entity class
     """
-    def __init__(self, hf_split, src_tok, tgt_tok, src_lang, tgt_lang):
-        self.data     = hf_split
-        self.src_tok  = src_tok
-        self.tgt_tok  = tgt_tok
-        self.src_lang = src_lang
-        self.tgt_lang = tgt_lang
+    prefix     = f"<2{target_lang}> "
+    prefix_len = len(prefix)
+    tagged_src = [prefix + t for t in src_texts]
 
-    def __len__(self): return len(self.data)
+    # Bước 1: spaCy → char-level tag map
+    char_tag_maps = []
+    for doc in nlp.pipe(src_texts, batch_size=32):
+        char_tags: dict[int, int] = {}
+        for ent in doc.ents:
+            tag_id = ner_vocab.get(_SPACY_TO_NER.get(ent.label_, ""), 0)
+            if tag_id:
+                for c in range(ent.start_char, ent.end_char):
+                    char_tags[c] = tag_id
+        char_tag_maps.append(char_tags)
 
-    def __getitem__(self, idx):
-        pair    = self.data[idx]["translation"]
-        src_txt = pair[self.src_lang]
-        tgt_txt = pair[self.tgt_lang]
-
-        # Encode source
-        src_enc = self.src_tok(
-            src_txt, truncation=True, max_length=MAX_SRC_LEN,
-            padding="max_length", return_tensors="pt",
-        )
-
-        # Encode target — mT5 tokenizer
-        with self.tgt_tok.as_target_tokenizer():
-            tgt_enc = self.tgt_tok(
-                tgt_txt, truncation=True, max_length=MAX_TGT_LEN,
-                padding="max_length", return_tensors="pt",
-            )
-
-        tgt_ids = tgt_enc["input_ids"].squeeze(0)   # (T,)
-        tgt_mask= tgt_enc["attention_mask"].squeeze(0)
-
-        # Decoder input: [BOS, t0, t1, ..., t_{n-1}]
-        # Labels       : [t0,  t1, ..., t_{n-1}, EOS]   (-100 ở padding)
-        bos_id  = self.tgt_tok.pad_token_id or 0
-        dec_input = torch.cat([torch.tensor([bos_id]), tgt_ids[:-1]])
-
-        labels  = tgt_ids.clone()
-        labels[tgt_mask == 0] = -100   # ignore padding
-
-        return {
-            "src_ids":   src_enc["input_ids"].squeeze(0),
-            "src_mask":  src_enc["attention_mask"].squeeze(0),
-            "tgt_ids":   dec_input,
-            "tgt_mask":  tgt_mask,
-            "labels":    labels,
-        }
-
-
-# ── Checkpoint ────────────────────────────────────────────────────────────────
-
-class Checkpointer:
-    def __init__(self, save_dir, every_min=30, max_keep=3):
-        os.makedirs(save_dir, exist_ok=True)
-        self.dir, self.interval = save_dir, every_min * 60
-        self.max_keep, self.last_save, self.queue = max_keep, time.time(), []
-
-    def _state(self, model, opt, sch, epoch, metrics):
-        return dict(epoch=epoch, metrics=metrics, model=model.state_dict(),
-                    optimizer=opt.state_dict(), scheduler=sch.state_dict())
-
-    def _write(self, state, name):
-        path = os.path.join(self.dir, name)
-        torch.save(state, path)
-        return path
-
-    def tick(self, model, opt, sch, epoch, step, metrics):
-        if time.time() - self.last_save < self.interval: return
-        path = self._write(self._state(model, opt, sch, epoch, metrics),
-                           f"mtt_ep{epoch}_s{step}_{datetime.now().strftime('%H%M%S')}.pt")
-        self.queue.append(path)
-        if len(self.queue) > self.max_keep:
-            old = self.queue.pop(0)
-            if os.path.exists(old): os.remove(old)
-        self.last_save = time.time()
-        log.info(f"[CKPT] interval → {os.path.basename(path)}")
-
-    def save_best(self, model, opt, sch, epoch, metrics):
-        self._write(self._state(model, opt, sch, epoch, metrics), "mtt_best.pt")
-        log.info(f"[CKPT] best → loss={metrics.get('loss', 0):.4f}")
-
-    @staticmethod
-    def load(path, model, opt=None, sch=None):
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        if opt: opt.load_state_dict(ckpt["optimizer"])
-        if sch: sch.load_state_dict(ckpt["scheduler"])
-        log.info(f"[CKPT] loaded epoch={ckpt['epoch']} | {ckpt.get('metrics', {})}")
-        return ckpt["epoch"], ckpt.get("metrics", {})
-
-
-# ── Train / Eval — 1 hàm dùng chung ──────────────────────────────────────────
-
-def run_epoch(model, loader, opt, sch, scaler, ckpt, epoch, device, is_train):
-    model.train() if is_train else model.eval()
-    total_loss, steps, t0 = 0.0, 0, time.time()
-
-    with (torch.enable_grad() if is_train else torch.no_grad()):
-        if is_train: opt.zero_grad()
-        for step, batch in enumerate(loader):
-            src_ids  = batch["src_ids"].to(device)
-            src_mask = batch["src_mask"].to(device)
-            tgt_ids  = batch["tgt_ids"].to(device)
-            tgt_mask = batch["tgt_mask"].to(device)
-            labels   = batch["labels"].to(device)
-
-            with autocast(enabled=device.type == "cuda"):
-                out  = model(src_ids, src_mask, tgt_ids, tgt_mask, labels)
-                loss = out["loss"] / (GRAD_ACCUM if is_train else 1)
-
-            if is_train:
-                scaler.scale(loss).backward()
-                if (step + 1) % GRAD_ACCUM == 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-                    scaler.step(opt);  scaler.update()
-                    opt.zero_grad();   sch.step()
-                    ckpt.tick(model, opt, sch, epoch, step,
-                              {"loss": loss.item() * GRAD_ACCUM})
-
-            total_loss += loss.item() * (GRAD_ACCUM if is_train else 1)
-            steps += 1
-
-            if is_train and step % 100 == 0:
-                log.info(f"  Ep{epoch} {step:4d}/{len(loader)} | "
-                         f"loss={loss.item()*GRAD_ACCUM:.4f} | {time.time()-t0:.0f}s")
-
-    return {"loss": total_loss / max(steps, 1)}
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main(batch_size):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"Device: {device}")
-
-    model = MTT().to(device)
-    model.paramsCalc()
-
-    log.info(f"Loading opus-100 ({SRC_LANG}-{TGT_LANG}) ...")
-    raw = load_dataset("Helsinki-NLP/opus-100", f"{SRC_LANG}-{TGT_LANG}")
-    # opus-100 chỉ có train + validation
-    splits = raw["train"].train_test_split(test_size=0.01, seed=42)
-
-    def make_loader(hf_split, shuffle):
-        return DataLoader(
-            TranslationDataset(hf_split, model.src_tokenizer,
-                               model.tgt_tokenizer, SRC_LANG, TGT_LANG),
-            batch_size=batch_size, shuffle=shuffle, pin_memory=True,
-        )
-
-    train_loader = make_loader(splits["train"], True)
-    val_loader   = make_loader(splits["test"],  False)
-    log.info(f"  train={len(train_loader)} | val={len(val_loader)} batches")
-
-    opt = torch.optim.AdamW([
-        {"params": list(model.encoder.parameters()),  "lr": LR_ENCODER},
-        {"params": (list(model.projector.parameters()) +
-                    list(model.decoder.parameters())  +
-                    list(model.lm_head.parameters())  +
-                    list(model.tgt_embed.parameters())), "lr": LR_DECODER},
-    ], weight_decay=WEIGHT_DECAY)
-
-    steps_per_epoch = len(train_loader) // GRAD_ACCUM
-    sch = get_linear_schedule_with_warmup(
-        opt,
-        num_warmup_steps   = int(steps_per_epoch * WARMUP_RATIO),
-        num_training_steps = steps_per_epoch * 5,
+    # Bước 2: tokenize với offset_mapping
+    enc = tokenizer(
+        tagged_src,
+        padding               = True,
+        truncation            = True,
+        max_length            = max_length,
+        return_tensors        = "pt",
+        return_offsets_mapping= True,
     )
 
-    scaler     = GradScaler(enabled=device.type == "cuda")
-    ckpt       = Checkpointer(CHECKPOINT_DIR, SAVE_EVERY_MIN)
-    best_loss  = float("inf")
-    no_improve = 0
-    start_ep   = 0
+    B, seq_len = enc.input_ids.shape
+    tag_tensor = torch.full((B, seq_len), -100, dtype=torch.long)
 
-    if RESUME and os.path.exists(RESUME):
-        start_ep, m = Checkpointer.load(RESUME, model, opt, sch)
-        model = model.to(device)
-        best_loss = m.get("loss", float("inf"))
-        start_ep += 1
-
-    NUM_EPOCHS = 5
-    log.info(f"Training {SRC_LANG}→{TGT_LANG} | "
-             f"{NUM_EPOCHS} epochs | early stop={EARLY_STOP} | "
-             f"effective batch={batch_size}×{GRAD_ACCUM}={batch_size*GRAD_ACCUM}")
-    history = []
-
-    try:
-        for epoch in range(start_ep, NUM_EPOCHS):
-            t0      = time.time()
-            train_m = run_epoch(model, train_loader, opt, sch, scaler, ckpt, epoch, device, True)
-            val_m   = run_epoch(model, val_loader,   opt, sch, scaler, ckpt, epoch, device, False)
-
-            history.append({"epoch": epoch, "train": train_m, "val": val_m})
-            log.info(f"\nEpoch {epoch} | {time.time()-t0:.0f}s\n"
-                     f"  train loss={train_m['loss']:.4f}\n"
-                     f"  val   loss={val_m['loss']:.4f}\n")
-
-            if val_m["loss"] < best_loss:
-                best_loss  = val_m["loss"]
-                no_improve = 0
-                ckpt.save_best(model, opt, sch, epoch, val_m)
-            else:
-                no_improve += 1
-                log.info(f"  [Early stop] không cải thiện {no_improve}/{EARLY_STOP}")
-                if no_improve >= EARLY_STOP:
-                    log.info(f"  [Early stop] dừng tại epoch {epoch}")
+    for i in range(B):
+        for j in range(seq_len):
+            start, end = enc.offset_mapping[i, j].tolist()
+            if start == 0 and end == 0:        # special token
+                continue
+            if end <= prefix_len:              # prefix <2lang>
+                continue
+            # subword thuộc source text
+            src_start = start - prefix_len
+            src_end   = end   - prefix_len
+            tag = 0
+            for c in range(max(0, src_start), src_end):
+                if c in char_tag_maps[i]:
+                    tag = char_tag_maps[i][c]
                     break
+            tag_tensor[i, j] = tag
 
-    except KeyboardInterrupt:
-        log.info("\n[STOP] Ctrl+C — lưu checkpoint ...")
-        ckpt._write(ckpt._state(model, opt, sch, epoch, {}),
-                    f"mtt_interrupted_ep{epoch}.pt")
+    return tag_tensor.to(device)
 
-    with open(os.path.join(CHECKPOINT_DIR, "summary.json"), "w") as f:
-        json.dump({"best_val_loss": best_loss, "history": history,
-                   "src_lang": SRC_LANG, "tgt_lang": TGT_LANG}, f, indent=2)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+CFG = dict(
+    languages            = ["de", "fr", "vi", "es"],   # paired with "en" + each other
+    max_samples_per_pair = 50_000,
+
+    train_steps          = 800,    # train steps per cycle
+    test_steps           = 200,    # test  steps per cycle (runs right after train)
+
+    batch_size           = 4,
+    accum_steps          = 4,      # gradient accumulation → effective batch = 4×4 = 16
+    lr                   = 5e-5,
+    grad_clip            = 1.0,
+
+    # Warmup + Cosine Decay (restart mỗi cycle)
+    warmup_steps         = 400,    # optimizer steps để linear warm-up
+    lr_min               = 1e-7,   # sàn LR trong cosine phase
+
+    checkpoint_path      = "mtt_checkpoint.pt",
+    checkpoint_minutes   = 30.0,
+
+    device               = "cuda" if torch.cuda.is_available() else "cpu",
+    num_workers          = max(0, (os.cpu_count() or 1) - 1),
+
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA FETCHING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_opus(lang: str, split: str, max_n: int) -> list:
+    """
+    Fetch en↔lang from OPUS-100. Returns [(en_text, lang_text)].
+    OPUS-100 always stores pairs as "en-xx" (English on one side).
+    """
+    from datasets import load_dataset  # lazy import
+
+    for key in [f"en-{lang}", f"{lang}-en"]:
+        try:
+            ds  = load_dataset("Helsinki-NLP/opus-100", key, split=split)
+            out = []
+            for row in ds:
+                t = row["translation"]
+                if "en" in t and lang in t:
+                    out.append((t["en"], t[lang]))
+                if len(out) >= max_n:
+                    break
+            print(f"  [DATA]  en↔{lang:<4}  {split:<12}  {len(out):>7,}  (key={key})")
+            return out
+        except Exception as e:
+            print(f"  [DATA]  en↔{lang}  key={key} failed: {e}")
+            continue
+
+    print(f"  [DATA]  en↔{lang}  not found in OPUS-100, skipping.")
+    return []
+
+
+def fetch_all_pairs() -> tuple:
+    """
+    Fetch en↔X for every language X.
+    Stores data in BOTH directions:
+      - under tgt=X : (en_src → X_tgt)   model learns to translate INTO X
+      - under tgt=en: (X_src → en_tgt)   model learns to translate INTO en
+    Also builds cross-language pairs via English pivot and stores them
+    under the correct target language with proper test splits.
+
+    Returns:
+        train_by_lang : { tgt_lang -> [(src_text, tgt_text), ...] }
+        test_by_lang  : { tgt_lang -> [(src_text, tgt_text), ...] }
+    """
+    max_n     = CFG["max_samples_per_pair"]
+    langs     = CFG["languages"]   # ["de", "fr", "vi", "es"]
+
+    train_by_lang: dict[str, list] = {}
+    test_by_lang:  dict[str, list] = {}
+
+    # Cache en↔X data so we don't re-download for pivot
+    cache_train: dict[str, list] = {}   # lang -> [(en, lang_text)]
+    cache_test:  dict[str, list] = {}
+
+    # ── Step 1: fetch en↔X for every X ────────────────────────────────────────
+    for lang in langs:
+        train_rows = _fetch_opus(lang, "train",      max_n)
+        test_rows  = _fetch_opus(lang, "validation", max_n // 5)
+
+        cache_train[lang] = train_rows
+        cache_test[lang]  = test_rows
+
+        if not train_rows:
+            print(f"  [DATA]  WARNING: no data for {lang}, skipping.")
+            continue
+
+        # Dedup test vs train (kiểm tra hash để chắc chắn không overlap)
+        train_keys = {s + "|||" + t for s, t in train_rows}
+        test_rows  = [(s, t) for s, t in test_rows if s + "|||" + t not in train_keys]
+
+        # en → lang  (model learns to produce lang)
+        train_by_lang.setdefault(lang, []).extend(
+            [(en, lx) for en, lx in train_rows]
+        )
+        test_by_lang.setdefault(lang, []).extend(
+            [(en, lx) for en, lx in test_rows]
+        )
+
+        # lang → en  (model learns to produce en)
+        train_by_lang.setdefault("en", []).extend(
+            [(lx, en) for en, lx in train_rows]
+        )
+        test_by_lang.setdefault("en", []).extend(
+            [(lx, en) for en, lx in test_rows]
+        )
+
+    # ── Step 2: cross-language pairs via English pivot ─────────────────────────
+    # For every pair (l1, l2), build l1→l2 by matching on the English sentence.
+    # Both train AND test are pivoted so test sets are never empty.
+    for i in range(len(langs)):
+        for j in range(i + 1, len(langs)):
+            l1, l2 = langs[i], langs[j]
+            if not cache_train.get(l1) or not cache_train.get(l2):
+                continue
+
+            print(f"  [DATA]  Pivoting {l1}→{l2} and {l2}→{l1} through English...")
+
+            # train pivot
+            en_to_l1 = {en: lx for en, lx in cache_train[l1]}
+            en_to_l2 = {en: lx for en, lx in cache_train[l2]}
+            common   = set(en_to_l1) & set(en_to_l2)
+
+            pivot_l1_l2 = [(en_to_l1[e], en_to_l2[e]) for e in common][:max_n]
+            pivot_l2_l1 = [(en_to_l2[e], en_to_l1[e]) for e in common][:max_n]
+            random.shuffle(pivot_l1_l2)
+            random.shuffle(pivot_l2_l1)
+
+            # test pivot
+            en_to_l1_t = {en: lx for en, lx in cache_test.get(l1, [])}
+            en_to_l2_t = {en: lx for en, lx in cache_test.get(l2, [])}
+            common_t   = set(en_to_l1_t) & set(en_to_l2_t)
+
+            pivot_l1_l2_t = [(en_to_l1_t[e], en_to_l2_t[e]) for e in common_t][:max_n // 5]
+            pivot_l2_l1_t = [(en_to_l2_t[e], en_to_l1_t[e]) for e in common_t][:max_n // 5]
+
+            train_by_lang.setdefault(l2, []).extend(pivot_l1_l2)
+            train_by_lang.setdefault(l1, []).extend(pivot_l2_l1)
+            test_by_lang.setdefault(l2,  []).extend(pivot_l1_l2_t)
+            test_by_lang.setdefault(l1,  []).extend(pivot_l2_l1_t)
+
+            print(f"  [DATA]  Pivoted  {l1}→{l2}  train={len(pivot_l1_l2):,}  test={len(pivot_l1_l2_t):,}")
+            print(f"  [DATA]  Pivoted  {l2}→{l1}  train={len(pivot_l2_l1):,}  test={len(pivot_l2_l1_t):,}")
+
+    for lang in train_by_lang:
+        random.shuffle(train_by_lang[lang])
+    for lang in test_by_lang:
+        random.shuffle(test_by_lang[lang])
+
+    print(f"\n  [DATA]  Languages loaded: {sorted(train_by_lang.keys())}")
+    for lang in sorted(train_by_lang):
+        print(f"  [DATA]    {lang}  "
+              f"train={len(train_by_lang[lang]):,}  "
+              f"test={len(test_by_lang.get(lang, [])):,}")
+    print()
+    return train_by_lang, test_by_lang
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATASET  — one dataset per language, all samples share the same target lang
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MonolingualDataset(Dataset):
+    """
+    Every sample in this dataset has the same target language.
+    One batch = one language = one clean forward pass, no grouping needed.
+    """
+    def __init__(self, samples: list):
+        self.samples = samples  # [(src_text, tgt_text), ...]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        return self.samples[idx]  # (src_text, tgt_text)
+
+
+def collate_fn(batch):
+    srcs, tgts = zip(*batch)
+    return list(srcs), list(tgts)
+
+
+def _infinite(loader: DataLoader):
+    """Yield batches forever, reshuffling each epoch."""
+    while True:
+        yield from loader
+
+
+def make_lang_loaders(by_lang: dict, batch_size: int,
+                      num_workers: int, pin_memory: bool,
+                      shuffle: bool) -> dict:
+    """Build one infinite iterator per language."""
+    return {
+        lang: _infinite(DataLoader(
+            MonolingualDataset(samples),
+            batch_size         = batch_size,
+            shuffle            = shuffle,
+            collate_fn         = collate_fn,
+            num_workers        = num_workers,
+            pin_memory         = pin_memory,
+            persistent_workers = num_workers > 0,
+            drop_last          = True,
+        ))
+        for lang, samples in by_lang.items()
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CHECKPOINT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_checkpoint(model, optimizer, scheduler, scaler, global_step: int, cycle: int):
+    torch.save({
+        "global_step": global_step,
+        "cycle":       cycle,
+        "model":       model.state_dict(),
+        "optimizer":   optimizer.state_dict(),
+        "scheduler":   scheduler.state_dict(),
+        "scaler":      scaler.state_dict(),
+        "lr":          optimizer.param_groups[0]["lr"],
+    }, CFG["checkpoint_path"])
+    print(f"  [CKPT]  Saved → {CFG['checkpoint_path']}  "
+          f"(global step {global_step}, cycle {cycle})")
+
+
+def load_checkpoint(model, optimizer, scheduler, scaler, device: str) -> tuple:
+    path = CFG["checkpoint_path"]
+    if not os.path.exists(path):
+        return 0, 0
+    ckpt = torch.load(path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    if "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+    for pg in optimizer.param_groups:
+        pg["lr"] = ckpt["lr"]
+    print(f"  [CKPT]  Resumed — global step {ckpt['global_step']}  "
+          f"cycle {ckpt['cycle']}  lr={ckpt['lr']:.2e}")
+    return ckpt["global_step"], ckpt["cycle"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def train(model: MTT,
+          train_by_lang: dict,
+          test_by_lang:  dict,
+          nlp = None):
+
+    device      = CFG["device"]
+    ckpt_sec    = CFG["checkpoint_minutes"] * 60
+    accum_steps = CFG["accum_steps"]
+    use_amp     = (device == "cuda")
+    use_pin     = (device == "cuda")
+
+    model.to(device)
+
+    if hasattr(model.encoder, "gradient_checkpointing_enable"):
+        model.encoder.gradient_checkpointing_enable()
+    if hasattr(model.decoder, "gradient_checkpointing_enable"):
+        model.decoder.gradient_checkpointing_enable()
+
+    optimizer = optim.AdamW(model.parameters(),
+                            lr=CFG["lr"], weight_decay=1e-2)
+
+    # Warmup linear → cosine decay, restart mỗi cycle
+    _warmup  = CFG["warmup_steps"]
+    _cycle   = CFG["train_steps"]
+    _min_r   = CFG["lr_min"] / CFG["lr"]
+    def _lr_lambda(step: int) -> float:
+        if step < _warmup:
+            return step / max(1, _warmup)
+        pos = (step - _warmup) % _cycle
+        return _min_r + (1 - _min_r) * 0.5 * (1 + math.cos(math.pi * pos / _cycle))
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+
+    scaler = GradScaler(device, enabled=use_amp)
+
+    global_step, cycle = load_checkpoint(model, optimizer, scheduler, scaler, device)
+
+    # One infinite iterator per language for train and test
+    train_iters = make_lang_loaders(train_by_lang, CFG["batch_size"],
+                                    CFG["num_workers"], use_pin, shuffle=True)
+    test_iters  = make_lang_loaders(test_by_lang,  CFG["batch_size"],
+                                    CFG["num_workers"], use_pin, shuffle=False)
+
+    # Round-robin order so all languages are visited equally each cycle
+    train_langs = sorted(train_iters.keys())
+    test_langs  = sorted(test_iters.keys())
+
+    # Graceful Ctrl+C
+    stop = False
+    def _on_stop(sig, frame):
+        nonlocal stop
+        print("\n\n  [STOP]  Ctrl+C — finishing this step then saving...\n")
+        stop = True
+    signal.signal(signal.SIGINT, _on_stop)
+
+    last_ckpt = time.time()
+    eff_batch = CFG["batch_size"] * accum_steps
+
+    print(f"\n{'═'*64}")
+    print(f"  MTT Training  |  device={device}  |  lr={CFG['lr']:.2e}")
+    print(f"  micro-batch={CFG['batch_size']}  accum={accum_steps}  effective batch={eff_batch}")
+    print(f"  Mixed precision fp16 : {use_amp}  |  Gradient checkpointing : ON")
+    print(f"  Cycle = {CFG['train_steps']} train steps + {CFG['test_steps']} test steps")
+    print(f"  Each step = one monolingual batch (one language, always correct)")
+    print(f"  Languages : {train_langs}")
+    print(f"  LR: warmup {CFG['warmup_steps']} steps → cosine/cycle → min={CFG['lr_min']:.1e}")
+    print(f"  NER: spaCy → offset_mapping align → forward() nerTags")
+    print(f"  Checkpoint every {CFG['checkpoint_minutes']} min + end of each cycle")
+    print(f"  Press Ctrl+C to stop safely at any time")
+    print(f"{'═'*64}\n")
+
+    while not stop:
+        cycle += 1
+
+        print(f"\n{'─'*64}")
+        print(f"  CYCLE {cycle}  |  global step: {global_step}")
+        print(f"{'─'*64}\n")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE 1 — TRAIN  (800 steps)
+        # Each step: pick next language round-robin → pull one monolingual batch
+        # ══════════════════════════════════════════════════════════════════════
+        model.train()
+        train_loss_sum = 0.0
+        accum_loss     = 0.0
+        train_step     = 0
+        optimizer.zero_grad(set_to_none=True)
+
+        # Shuffled language schedule — one language per micro-step.
+        # Each block contains every language once, shuffled randomly.
+        total_micro = CFG["train_steps"] * accum_steps
+        schedule    = []
+        while len(schedule) < total_micro:
+            block = train_langs.copy()
+            random.shuffle(block)
+            schedule.extend(block)
+        schedule = schedule[:total_micro]
+
+        langs_in_step = []   # collect langs across micro-batches for logging
+
+        for micro_step, lang in enumerate(schedule, 1):
+            if stop:
+                break
+            langs_in_step.append(lang)
+            srcs, tgts = next(train_iters[lang])
+
+            # ── NER: spaCy → align offset → nerTags ──────────────────────────
+            ner_tags = None
+            if nlp is not None:
+                try:
+                    ner_tags = _extract_ner_tags(
+                        src_texts=srcs, target_lang=lang, nlp=nlp,
+                        tokenizer=model.tokenizer, ner_vocab=model.nerVocab,
+                        max_length=128, device=device,
+                    )
+                except Exception as e:
+                    print(f"  [NER ]  WARNING: {e} — skipping nerTags this step")
+
+            with autocast(device, enabled=use_amp):
+                out  = model(
+                    srcText    = srcs,
+                    targetLang = lang,      # entire batch is this language
+                    targetText = tgts,
+                    nerTags    = ner_tags,
+                    returnLoss = True,
+                    device     = device,
+                )
+                loss = out["loss"] / accum_steps
+
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
+
+            if micro_step % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()           # warmup + cosine per optimizer step
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step    += 1
+                train_step     += 1
+                train_loss_sum += accum_loss
+
+                trans      = out["translationLoss"]
+                ner        = out["nerLoss"]
+                langs_str  = "+".join(langs_in_step)   # e.g. "de+fr+vi+es"
+                print(
+                    f"  [TRAIN]"
+                    f"  global={global_step:>7}"
+                    f"  cycle={cycle}  step={train_step:>3}/{CFG['train_steps']}"
+                    f"  langs=[{langs_str}]"
+                    f"  loss={accum_loss:.4f}"
+                    + (f"  trans={trans.item()/accum_steps:.4f}" if trans is not None else "")
+                    + (f"  ner={ner.item()/accum_steps:.4f}"     if ner   is not None else "")
+                    + f"  lr={optimizer.param_groups[0]['lr']:.2e}"
+                )
+                accum_loss    = 0.0
+                langs_in_step = []   # reset for next step
+
+                if time.time() - last_ckpt >= ckpt_sec:
+                    save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
+                    last_ckpt = time.time()
+
+                if global_step % 50 == 0 and device == "cuda":
+                    torch.cuda.empty_cache()
+
+        avg_train = train_loss_sum / max(train_step, 1)
+        print(f"\n  [CYCLE {cycle}]  ── Train done ──  avg loss: {avg_train:.4f}\n")
+
+        if stop:
+            break
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE 2 — TEST  (200 steps, no gradients)
+        # Same round-robin: each step is one monolingual batch
+        # ══════════════════════════════════════════════════════════════════════
+        model.eval()
+        test_loss_sum  = 0.0
+        test_trans_sum = 0.0
+        test_ner_sum   = 0.0
+
+        test_schedule = []
+        while len(test_schedule) < CFG["test_steps"]:
+            block = test_langs.copy()
+            random.shuffle(block)
+            test_schedule.extend(block)
+        test_schedule = test_schedule[:CFG["test_steps"]]
+
+        with torch.no_grad():
+            for test_step, lang in enumerate(test_schedule, 1):
+                srcs, tgts = next(test_iters[lang])
+
+                # ── NER cho test ──────────────────────────────────────────────
+                ner_tags = None
+                if nlp is not None:
+                    try:
+                        ner_tags = _extract_ner_tags(
+                            src_texts=srcs, target_lang=lang, nlp=nlp,
+                            tokenizer=model.tokenizer, ner_vocab=model.nerVocab,
+                            max_length=128, device=device,
+                        )
+                    except Exception:
+                        pass
+
+                with autocast(device, enabled=use_amp):
+                    out = model(
+                        srcText    = srcs,
+                        targetLang = lang,
+                        targetText = tgts,
+                        nerTags    = ner_tags,
+                        returnLoss = True,
+                        device     = device,
+                    )
+
+                lv = out["loss"].item()
+                test_loss_sum += lv
+                if out["translationLoss"] is not None:
+                    test_trans_sum += out["translationLoss"].item()
+                if out["nerLoss"] is not None:
+                    test_ner_sum += out["nerLoss"].item()
+
+                print(
+                    f"  [TEST ]"
+                    f"  global={global_step:>7}"
+                    f"  cycle={cycle}  test_step={test_step:>3}/{CFG['test_steps']}"
+                    f"  lang={lang}"
+                    f"  loss={lv:.4f}"
+                )
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        n         = CFG["test_steps"]
+        avg_test  = test_loss_sum  / n
+        avg_trans = test_trans_sum / n
+        avg_ner   = test_ner_sum   / n
+        print(f"\n  [CYCLE {cycle}]  ── Test done ──  "
+              f"avg loss: {avg_test:.4f}  trans: {avg_trans:.4f}  ner: {avg_ner:.4f}  "
+              f"lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        print()
+        save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
+        last_ckpt = time.time()
+
+    save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
+    print(f"\n  Stopped at global step {global_step}, cycle {cycle}. Goodbye!")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch_size", type=int, default=8)
-    main(parser.parse_args().batch_size)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    nlp = _load_spacy("xx_ent_wiki_sm")
+
+    print("  Fetching data from HuggingFace OPUS-100...\n")
+    train_by_lang, test_by_lang = fetch_all_pairs()
+
+    model = MTT()
+    model.paramsCalc()
+
+    train(model, train_by_lang, test_by_lang, nlp)
