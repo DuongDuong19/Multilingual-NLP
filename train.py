@@ -1,477 +1,339 @@
 """
-MTT Training Script
-────────────────────────────────────────────────────────────────
-One cycle = 800 train steps + 200 test steps = 1000 total
-Each step = one monolingual batch (one language per batch, always)
-After each cycle: LR auto-adjusted based on avg test loss
-Runs forever — press Ctrl+C to stop safely
-Checkpoint every 30 minutes + end of every cycle
-All language pairs fetched automatically from OPUS-100
+train.py  –  Train MTT 5 epochs, checkpoint mỗi 30 phút.
+Tối ưu cho GPU 6GB:
+  - bf16 (stable hơn fp16, không bị overflow → NaN)
+  - 8-bit AdamW (bitsandbytes) → tiết kiệm ~2.4GB VRAM
+  - gradient checkpointing
+  - NaN guard: phát hiện NaN loss → skip step, không để lan
 
-Install:
-    pip install torch datasets sentencepiece transformers
+pip install bitsandbytes
+
+Chỉnh nếu OOM: giảm MAX_SRC_LEN / MAX_TGT_LEN trong model.py (128 → 64)
 """
 
-import math
-import os
-import random
-import signal
-import time
+import os, time, signal, math
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import spacy
 import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torch.amp import GradScaler, autocast
+from torch.utils.data import Dataset, DataLoader
+from transformers import get_cosine_schedule_with_warmup
+
+try:
+    import bitsandbytes as bnb
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
+    print("[WARN] bitsandbytes chưa cài → pip install bitsandbytes\n")
 
 from model import MTT
 
+# ════════════════════════════════════════════════════════════
+BATCH_SIZE = 1
+# ════════════════════════════════════════════════════════════
 
-# ── spaCy label → nerVocab key ────────────────────────────────────────────────
-_SPACY_TO_NER = {
-    "PERSON": "PERSON",
-    "PER": "PERSON",
-    "ORG": "ORG",
-    "LOC": "LOC",
-    "GPE": "GPE",
-    "DATE": "DATE",
-    "MONEY": "MONEY",
-    "PERCENT": "PERCENT",
-    "TIME": "TIME",
-    "QUANTITY": "QUANTITY",
-    "CARDINAL": "QUANTITY",
-}
+GRAD_ACCUM    = 8        # effective batch = 8
+LR            = 5e-5     # thấp hơn (3e-4 quá cao → loss diverge)
+WEIGHT_DECAY  = 0.01
+NUM_EPOCHS    = 50
+WARMUP_RATIO  = 0.1      # warmup dài hơn để khởi động ổn định
+CKPT_DIR      = "checkpoints"
+CKPT_INTERVAL = 30 * 60
+LOG_EVERY     = 20
+NUM_WORKERS   = 0
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def _load_spacy(model_name: str = "xx_ent_wiki_sm"):
-    """Load spaCy multilingual NER model (disable unneeded pipes)."""
-    try:
-        nlp = spacy.load(
-            model_name, disable=["tagger", "parser", "senter", "lemmatizer"]
-        )
-        print(f"  [NER ]  spaCy '{model_name}' loaded.")
-        return nlp
-    except OSError:
-        print(f"  [NER ]  Model '{model_name}' not found. Run:")
-        print(f"          python -m spacy download {model_name}")
-        raise
+# bf16 ổn định hơn fp16 (không overflow), dùng nếu GPU hỗ trợ
+USE_BF16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+USE_FP16 = torch.cuda.is_available() and not USE_BF16
+DTYPE    = torch.bfloat16 if USE_BF16 else torch.float16
+
+print(f"[INFO] Precision: {'bf16' if USE_BF16 else 'fp16' if USE_FP16 else 'fp32'}")
 
 
-def _extract_ner_tags(
-    src_texts: list[str],
-    target_lang: str,
-    nlp,
-    tokenizer,
-    ner_vocab: dict,
-    max_length: int = 128,
-    device: str = "cpu",
-) -> torch.Tensor:
-    """
-    1. Chạy spaCy NER trên src_texts (nguyên văn, không có prefix).
-    2. Tokenize tagged_src (có prefix <2lang>) với return_offsets_mapping=True.
-    3. Dùng offset để map từng subword → entity tag id.
+# ─── Dataset ─────────────────────────────────────────────────────────────────
 
-    Returns: LongTensor [B, seq_len]
-      -100  → special token / prefix token / padding  (ignored by cross_entropy)
-         0  → 'O' (mặc định)
-      1..N  → entity class
-    """
-    prefix = f"<2{target_lang}> "
-    prefix_len = len(prefix)
-    tagged_src = [prefix + t for t in src_texts]
-
-    # Bước 1: spaCy → char-level tag map
-    char_tag_maps = []
-    for doc in nlp.pipe(src_texts, batch_size=32):
-        char_tags: dict[int, int] = {}
-        for ent in doc.ents:
-            tag_id = ner_vocab.get(_SPACY_TO_NER.get(ent.label_, ""), 0)
-            if tag_id:
-                for c in range(ent.start_char, ent.end_char):
-                    char_tags[c] = tag_id
-        char_tag_maps.append(char_tags)
-
-    # Bước 2: tokenize với offset_mapping
-    enc = tokenizer(
-        tagged_src,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-        return_offsets_mapping=True,
-    )
-
-    B, seq_len = enc.input_ids.shape
-    tag_tensor = torch.full((B, seq_len), -100, dtype=torch.long)
-
-    for i in range(B):
-        for j in range(seq_len):
-            start, end = enc.offset_mapping[i, j].tolist()
-            if start == 0 and end == 0:  # special token
-                continue
-            if end <= prefix_len:  # prefix <2lang>
-                continue
-            # subword thuộc source text
-            src_start = start - prefix_len
-            src_end = end - prefix_len
-            tag = 0
-            for c in range(max(0, src_start), src_end):
-                if c in char_tag_maps[i]:
-                    tag = char_tag_maps[i][c]
-                    break
-            tag_tensor[i, j] = tag
-
-    return tag_tensor.to(device)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AMP DTYPE SELECTION
-# ── fp16  → NaN-prone trên T4/V100 vì range hẹp (±65504)
-# ── bf16  → an toàn hơn (range như fp32), cần Ampere+ (A100, RTX 30xx, L4)
-# ── fp32  → chậm nhất nhưng luôn ổn định, dùng khi GPU không hỗ trợ bf16
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _pick_amp_dtype(device: str):
-    """
-    Trả về (use_amp, amp_dtype):
-      - bf16 nếu GPU hỗ trợ  → nhanh + ổn định
-      - fp32 (AMP tắt) nếu không → không bao giờ NaN
-    fp16 bị loại bỏ hoàn toàn.
-    """
-    if device != "cuda":
-        return False, torch.float32
-
-    if torch.cuda.is_bf16_supported():
-        print("  [AMP ]  bf16 được hỗ trợ → dùng bf16 (nhanh + ổn định)")
-        return True, torch.bfloat16
-
-    gpu_name = torch.cuda.get_device_name(0)
-    print(f"  [AMP ]  GPU '{gpu_name}' không hỗ trợ bf16 → tắt AMP, dùng fp32")
-    print("  [AMP ]  (fp16 bị bỏ vì dễ NaN; fp32 chậm hơn ~20% nhưng luôn ổn định)")
-    return False, torch.float32
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CONFIG
-# ══════════════════════════════════════════════════════════════════════════════
-
-CFG = dict(
-    languages=["de", "fr", "vi", "es"],  # paired with "en" + each other
-    max_samples_per_pair=50_000,
-    train_steps=10000,  # train steps per cycle
-    test_steps=200,  # test  steps per cycle (runs right after train)
-    batch_size=16,
-    accum_steps=8,  # gradient accumulation → effective batch = 4×4 = 16
-    lr=5e-5,
-    grad_clip=1.0,
-    # Warmup + Cosine Decay (restart mỗi cycle)
-    warmup_steps=400,  # optimizer steps để linear warm-up
-    lr_min=1e-7,  # sàn LR trong cosine phase
-    checkpoint_path="mtt_checkpoint.pt",
-    checkpoint_minutes=30.0,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    num_workers=max(0, (os.cpu_count() or 1) - 1),
-)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHING
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def _fetch_opus(lang: str, split: str, max_n: int) -> list:
-    """
-    Fetch en↔lang from OPUS-100. Returns [(en_text, lang_text)].
-    OPUS-100 always stores pairs as "en-xx" (English on one side).
-    """
-    from datasets import load_dataset  # lazy import
-
-    for key in [f"en-{lang}", f"{lang}-en"]:
-        try:
-            ds = load_dataset("Helsinki-NLP/opus-100", key, split=split)
-            out = []
-            for row in ds:
-                t = row["translation"]
-                if "en" in t and lang in t:
-                    out.append((t["en"], t[lang]))
-                if len(out) >= max_n:
-                    break
-            print(f"  [DATA]  en↔{lang:<4}  {split:<12}  {len(out):>7,}  (key={key})")
-            return out
-        except Exception as e:
-            print(f"  [DATA]  en↔{lang}  key={key} failed: {e}")
-            continue
-
-    print(f"  [DATA]  en↔{lang}  not found in OPUS-100, skipping.")
-    return []
-
-
-def fetch_all_pairs() -> tuple:
-    """
-    Fetch en↔X for every language X.
-    Stores data in BOTH directions:
-      - under tgt=X : (en_src → X_tgt)   model learns to translate INTO X
-      - under tgt=en: (X_src → en_tgt)   model learns to translate INTO en
-    Also builds cross-language pairs via English pivot and stores them
-    under the correct target language with proper test splits.
-
-    Returns:
-        train_by_lang : { tgt_lang -> [(src_text, tgt_text), ...] }
-        test_by_lang  : { tgt_lang -> [(src_text, tgt_text), ...] }
-    """
-    max_n = CFG["max_samples_per_pair"]
-    langs = CFG["languages"]  # ["de", "fr", "vi", "es"]
-
-    train_by_lang: dict[str, list] = {}
-    test_by_lang: dict[str, list] = {}
-
-    # Cache en↔X data so we don't re-download for pivot
-    cache_train: dict[str, list] = {}  # lang -> [(en, lang_text)]
-    cache_test: dict[str, list] = {}
-
-    # ── Step 1: fetch en↔X for every X ────────────────────────────────────────
-    for lang in langs:
-        train_rows = _fetch_opus(lang, "train", max_n)
-        test_rows = _fetch_opus(lang, "validation", max_n // 5)
-
-        cache_train[lang] = train_rows
-        cache_test[lang] = test_rows
-
-        if not train_rows:
-            print(f"  [DATA]  WARNING: no data for {lang}, skipping.")
-            continue
-
-        # Dedup test vs train (kiểm tra hash để chắc chắn không overlap)
-        train_keys = {s + "|||" + t for s, t in train_rows}
-        test_rows = [(s, t) for s, t in test_rows if s + "|||" + t not in train_keys]
-
-        # en → lang  (model learns to produce lang)
-        train_by_lang.setdefault(lang, []).extend([(en, lx) for en, lx in train_rows])
-        test_by_lang.setdefault(lang, []).extend([(en, lx) for en, lx in test_rows])
-
-        # lang → en  (model learns to produce en)
-        train_by_lang.setdefault("en", []).extend([(lx, en) for en, lx in train_rows])
-        test_by_lang.setdefault("en", []).extend([(lx, en) for en, lx in test_rows])
-
-    # ── Step 2: cross-language pairs via English pivot ─────────────────────────
-    # For every pair (l1, l2), build l1→l2 by matching on the English sentence.
-    # Both train AND test are pivoted so test sets are never empty.
-    for i in range(len(langs)):
-        for j in range(i + 1, len(langs)):
-            l1, l2 = langs[i], langs[j]
-            if not cache_train.get(l1) or not cache_train.get(l2):
-                continue
-
-            print(f"  [DATA]  Pivoting {l1}→{l2} and {l2}→{l1} through English...")
-
-            # train pivot
-            en_to_l1 = {en: lx for en, lx in cache_train[l1]}
-            en_to_l2 = {en: lx for en, lx in cache_train[l2]}
-            common = set(en_to_l1) & set(en_to_l2)
-
-            pivot_l1_l2 = [(en_to_l1[e], en_to_l2[e]) for e in common][:max_n]
-            pivot_l2_l1 = [(en_to_l2[e], en_to_l1[e]) for e in common][:max_n]
-            random.shuffle(pivot_l1_l2)
-            random.shuffle(pivot_l2_l1)
-
-            # test pivot
-            en_to_l1_t = {en: lx for en, lx in cache_test.get(l1, [])}
-            en_to_l2_t = {en: lx for en, lx in cache_test.get(l2, [])}
-            common_t = set(en_to_l1_t) & set(en_to_l2_t)
-
-            pivot_l1_l2_t = [(en_to_l1_t[e], en_to_l2_t[e]) for e in common_t][
-                : max_n // 5
-            ]
-            pivot_l2_l1_t = [(en_to_l2_t[e], en_to_l1_t[e]) for e in common_t][
-                : max_n // 5
-            ]
-
-            train_by_lang.setdefault(l2, []).extend(pivot_l1_l2)
-            train_by_lang.setdefault(l1, []).extend(pivot_l2_l1)
-            test_by_lang.setdefault(l2, []).extend(pivot_l1_l2_t)
-            test_by_lang.setdefault(l1, []).extend(pivot_l2_l1_t)
-
-            print(
-                f"  [DATA]  Pivoted  {l1}→{l2}  train={len(pivot_l1_l2):,}  test={len(pivot_l1_l2_t):,}"
-            )
-            print(
-                f"  [DATA]  Pivoted  {l2}→{l1}  train={len(pivot_l2_l1):,}  test={len(pivot_l2_l1_t):,}"
-            )
-
-    for lang in train_by_lang:
-        random.shuffle(train_by_lang[lang])
-    for lang in test_by_lang:
-        random.shuffle(test_by_lang[lang])
-
-    print(f"\n  [DATA]  Languages loaded: {sorted(train_by_lang.keys())}")
-    for lang in sorted(train_by_lang):
-        print(
-            f"  [DATA]    {lang}  "
-            f"train={len(train_by_lang[lang]):,}  "
-            f"test={len(test_by_lang.get(lang, [])):,}"
-        )
-    print()
-    return train_by_lang, test_by_lang
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATASET  — one dataset per language, all samples share the same target lang
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class MonolingualDataset(Dataset):
-    """
-    Every sample in this dataset has the same target language.
-    One batch = one language = one clean forward pass, no grouping needed.
-    """
-
-    def __init__(self, samples: list):
-        self.samples = samples  # [(src_text, tgt_text), ...]
+class TextPairDataset(Dataset):
+    def __init__(self):
+        # ── THAY DATA THỰC VÀO ĐÂY ──────────────────────────────────────────
+        self.pairs = [
+            ("The president of France visited Vietnam last week.",
+             "Tổng thống Pháp đã thăm Việt Nam tuần trước."),
+            ("Apple Inc. reported record revenue in Q4 2024.",
+             "Apple Inc. báo cáo doanh thu kỷ lục trong Q4 2024."),
+            ("The river flooded three towns in southern Germany.",
+             "Dòng sông đã làm ngập lụt ba thị trấn ở miền nam nước Đức."),
+        ] * 300
+        # ────────────────────────────────────────────────────────────────────
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.pairs)
 
     def __getitem__(self, idx):
-        return self.samples[idx]  # (src_text, tgt_text)
+        return self.pairs[idx]
 
 
-def collate_fn(batch):
-    srcs, tgts = zip(*batch)
-    return list(srcs), list(tgts)
+def collate(batch):
+    has_ner = len(batch[0]) == 3
+    srcs = [b[0] for b in batch]
+    tgts = [b[1] for b in batch]
+    ner  = [b[2] for b in batch] if has_ner else None
+    return srcs, tgts, ner
 
 
-def _infinite(loader: DataLoader):
-    """Yield batches forever, reshuffling each epoch."""
-    while True:
-        yield from loader
+# ─── Checkpoint ──────────────────────────────────────────────────────────────
+
+def save_ckpt(model, optimizer, scheduler, epoch, step, loss):
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    path = os.path.join(CKPT_DIR, f"ckpt_ep{epoch}_step{step}.pt")
+    torch.save({
+        "epoch"          : epoch,
+        "step"           : step,
+        "model_state"    : model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "loss"           : loss,
+    }, path)
+    print(f"\n[CKPT] ✓ Saved → {path}  (loss={loss:.4f})\n")
 
 
-def make_lang_loaders(
-    by_lang: dict, batch_size: int, num_workers: int, pin_memory: bool, shuffle: bool
-) -> dict:
-    """Build one infinite iterator per language."""
-    return {
-        lang: _infinite(
-            DataLoader(
-                MonolingualDataset(samples),
-                batch_size=batch_size,
-                shuffle=shuffle,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                persistent_workers=num_workers > 0,
-                drop_last=True,
-            )
-        )
-        for lang, samples in by_lang.items()
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CHECKPOINT
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def save_checkpoint(model, optimizer, scheduler, scaler, global_step: int, cycle: int):
-    torch.save(
-        {
-            "global_step": global_step,
-            "cycle": cycle,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-            "lr": optimizer.param_groups[0]["lr"],
-        },
-        CFG["checkpoint_path"],
-    )
-    print(
-        f"  [CKPT]  Saved → {CFG['checkpoint_path']}  "
-        f"(global step {global_step}, cycle {cycle})"
-    )
-
-
-def load_checkpoint(model, optimizer, scheduler, scaler, device: str) -> tuple:
-    path = CFG["checkpoint_path"]
-    if not os.path.exists(path):
+def load_latest_ckpt(model, optimizer, scheduler):
+    if not os.path.isdir(CKPT_DIR):
         return 0, 0
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
-    if "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
-    for pg in optimizer.param_groups:
-        pg["lr"] = ckpt["lr"]
-    print(
-        f"  [CKPT]  Resumed — global step {ckpt['global_step']}  "
-        f"cycle {ckpt['cycle']}  lr={ckpt['lr']:.2e}"
+    pts = [f for f in os.listdir(CKPT_DIR) if f.endswith(".pt")]
+    if not pts:
+        return 0, 0
+    pts.sort(key=lambda f: int(f.split("step")[1].split(".")[0]) if "step" in f else -1)
+    path = os.path.join(CKPT_DIR, pts[-1])
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+
+    model_key = "model_state"     if "model_state"     in ckpt else "model"
+    opt_key   = "optimizer_state" if "optimizer_state" in ckpt else "optimizer"
+    sched_key = "scheduler_state" if "scheduler_state" in ckpt else "scheduler"
+
+    if model_key not in ckpt:
+        print(f"[WARN] Checkpoint {path} cấu trúc không nhận ra, bỏ qua.")
+        return 0, 0
+
+    model.load_state_dict(ckpt[model_key])
+    if opt_key   in ckpt: optimizer.load_state_dict(ckpt[opt_key])
+    if sched_key in ckpt: scheduler.load_state_dict(ckpt[sched_key])
+
+    epoch = ckpt.get("epoch", 0)
+    step  = ckpt.get("step",  0)
+    loss  = ckpt.get("loss",  float("nan"))
+    print(f"[CKPT] Resumed {path}  (epoch={epoch}, step={step}, loss={loss:.4f})")
+    return epoch, step
+
+
+# ─── Optimizer ───────────────────────────────────────────────────────────────
+
+def make_optimizer(model):
+    no_decay = {"bias", "LayerNorm.weight"}
+    params = [
+        {"params": [p for n, p in model.named_parameters()
+                    if p.requires_grad and not any(nd in n for nd in no_decay)],
+         "weight_decay": WEIGHT_DECAY},
+        {"params": [p for n, p in model.named_parameters()
+                    if p.requires_grad and     any(nd in n for nd in no_decay)],
+         "weight_decay": 0.0},
+    ]
+    if HAS_BNB:
+        print("[INFO] Dùng 8-bit AdamW (bitsandbytes)")
+        return bnb.optim.AdamW8bit(params, lr=LR)
+    else:
+        return torch.optim.AdamW(params, lr=LR)
+
+
+# ─── Train ───────────────────────────────────────────────────────────────────
+
+def train():
+    stop = False
+    def on_sigint(sig, frame):
+        nonlocal stop
+        print("\n[INFO] Ctrl+C – dừng sau step hiện tại và lưu checkpoint…")
+        stop = True
+    signal.signal(signal.SIGINT, on_sigint)
+
+    # Model
+    print("[INFO] Khởi tạo model…")
+    model = MTT().to(DEVICE)
+    model.enable_gradient_checkpointing()
+    print("[INFO] Param count:")
+    model.paramsCalc()
+
+    # GradScaler chỉ dùng cho fp16 (bf16 không cần scaler)
+    use_scaler = USE_FP16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler, init_scale=256)
+
+    # Optimizer
+    optimizer = make_optimizer(model)
+
+    # Dataset & loader
+    dataset = TextPairDataset()
+    loader  = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=False,
+        collate_fn=collate,
+        drop_last=True,
     )
     return ckpt["global_step"], ckpt["cycle"]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TRAINING LOOP
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
-
-    device = CFG["device"]
-    ckpt_sec = CFG["checkpoint_minutes"] * 60
-    accum_steps = CFG["accum_steps"]
-
-    # ── Chọn AMP dtype: bf16 nếu được, không thì tắt AMP dùng fp32 ──────────
-    # fp16 bị loại bỏ hoàn toàn vì dễ NaN với loss scale lớn
-    use_amp, amp_dtype = _pick_amp_dtype(device)
-    use_pin = device == "cuda"
-
-    model.to(device)
-
-    if hasattr(model.encoder, "gradient_checkpointing_enable"):
-        model.encoder.gradient_checkpointing_enable()
-    if hasattr(model.decoder, "gradient_checkpointing_enable"):
-        model.decoder.gradient_checkpointing_enable()
-
-    optimizer = optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=1e-2)
-
-    # Warmup linear → cosine decay, restart mỗi cycle
-    _warmup = CFG["warmup_steps"]
-    _cycle = CFG["train_steps"]
-    _min_r = CFG["lr_min"] / CFG["lr"]
-
-    def _lr_lambda(step: int) -> float:
-        if step < _warmup:
-            return step / max(1, _warmup)
-        pos = (step - _warmup) % _cycle
-        return _min_r + (1 - _min_r) * 0.5 * (1 + math.cos(math.pi * pos / _cycle))
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
-
-    # GradScaler chỉ có ý nghĩa với fp16; với bf16/fp32 vẫn tạo nhưng enabled=False
-    scaler = GradScaler(device, enabled=False)
-
-    global_step, cycle = load_checkpoint(model, optimizer, scheduler, scaler, device)
-
-    # One infinite iterator per language for train and test
-    train_iters = make_lang_loaders(
-        train_by_lang, CFG["batch_size"], CFG["num_workers"], use_pin, shuffle=True
-    )
-    test_iters = make_lang_loaders(
-        test_by_lang, CFG["batch_size"], CFG["num_workers"], use_pin, shuffle=False
+    # Scheduler
+    steps_per_epoch = math.ceil(len(dataset) / (BATCH_SIZE * GRAD_ACCUM))
+    total_steps     = steps_per_epoch * NUM_EPOCHS
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * WARMUP_RATIO),
+        num_training_steps=total_steps,
     )
 
-    # Round-robin order so all languages are visited equally each cycle
-    train_langs = sorted(train_iters.keys())
-    test_langs = sorted(test_iters.keys())
+    # Resume
+    start_epoch, global_step = load_latest_ckpt(model, optimizer, scheduler)
 
-    # Graceful Ctrl+C
-    stop = False
+    amp_ctx = torch.amp.autocast("cuda", dtype=DTYPE, enabled=(USE_BF16 or USE_FP16))
 
-    def _on_stop(sig, frame):
-        nonlocal stop
-        print("\n\n  [STOP]  Ctrl+C — finishing this step then saving...\n")
-        stop = True
+    print(f"\n[INFO] Training {NUM_EPOCHS} epochs | "
+          f"batch={BATCH_SIZE} | accum={GRAD_ACCUM} | effective={BATCH_SIZE*GRAD_ACCUM} | "
+          f"lr={LR} | device={DEVICE} | "
+          f"{'bf16' if USE_BF16 else 'fp16' if USE_FP16 else 'fp32'} | "
+          f"8bit={HAS_BNB}\n")
+
+    last_ckpt_time = time.time()
+    last_loss      = float("nan")
+    nan_count      = 0       # đếm NaN liên tiếp để cảnh báo
+    last_gen_loss  = 0.0
+    last_ner_loss  = 0.0
+
+    if start_epoch >= NUM_EPOCHS:
+        print(f"[INFO] Checkpoint đã train đủ {NUM_EPOCHS} epochs.")
+        print(f"[INFO] Tăng NUM_EPOCHS > {NUM_EPOCHS} để train thêm, hoặc xóa checkpoints/ để train lại.")
+        return
+
+    for epoch in range(start_epoch, NUM_EPOCHS):
+        if stop:
+            break
+
+        model.train()
+        epoch_loss, epoch_valid_steps = 0.0, 0
+        running_loss, micro           = 0.0, 0
+        optimizer.zero_grad(set_to_none=True)
+
+        for srcs, tgts, ner_labels in loader:
+            if stop:
+                break
+
+            # NER labels → tensor nếu có
+            ner_t = None
+            if ner_labels is not None:
+                src_len = model.MAX_SRC_LEN
+                padded  = [(seq + [-100] * src_len)[:src_len] for seq in ner_labels]
+                ner_t   = torch.tensor(padded, dtype=torch.long, device=DEVICE)
+
+            # ── Forward ──────────────────────────────────────────────────────
+            with amp_ctx:
+                total_loss, gen_loss, ner_loss = model(
+                    src_texts=srcs,
+                    tgt_texts=tgts,
+                    ner_labels=ner_t,
+                )
+
+            # ── NaN guard: bỏ qua batch này, không backward ──────────────────
+            if not torch.isfinite(total_loss):
+                nan_count += 1
+                if nan_count % 10 == 1:
+                    print(f"  [WARN] NaN/Inf loss tại micro-step, skip "
+                          f"(tổng {nan_count} lần). "
+                          f"gen={gen_loss.item():.2f}")
+                optimizer.zero_grad(set_to_none=True)
+                micro = 0   # reset accum để không step với gradient rác
+                continue
+            nan_count = 0   # reset nếu loss hợp lệ trở lại
+
+            # ── Backward ─────────────────────────────────────────────────────
+            loss = total_loss / GRAD_ACCUM
+            if use_scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            running_loss  += total_loss.item()
+            last_gen_loss  = gen_loss.item()
+            last_ner_loss  = ner_loss.item()
+            micro         += 1
+
+            # ── Optimizer step ───────────────────────────────────────────────
+            if micro % GRAD_ACCUM == 0:
+                if use_scaler:
+                    scaler.unscale_(optimizer)
+
+                # Clip gradient – quan trọng để tránh diverge
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
+
+                # Bỏ qua nếu gradient vẫn NaN sau clip
+                if not torch.isfinite(grad_norm):
+                    print(f"  [WARN] Gradient NaN/Inf (norm={grad_norm:.2f}), skip optimizer step")
+                    optimizer.zero_grad(set_to_none=True)
+                    if use_scaler:
+                        scaler.update()
+                    micro        = 0
+                    running_loss = 0.0
+                    continue
+
+                if use_scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step        += 1
+                epoch_valid_steps  += 1
+                avg                 = running_loss / GRAD_ACCUM
+                epoch_loss         += avg
+                last_loss           = avg
+                running_loss        = 0.0
+                micro               = 0
+
+                # Log
+                if global_step % LOG_EVERY == 0:
+                    lr_now = scheduler.get_last_lr()[0]
+                    vram   = torch.cuda.memory_allocated() / 1e9
+                    print(
+                        f"  ep {epoch+1}/{NUM_EPOCHS}  "
+                        f"step {global_step:>6d}  "
+                        f"loss={avg:.4f}  "
+                        f"gen={last_gen_loss:.4f}  "
+                        f"ner={last_ner_loss:.4f}  "
+                        f"lr={lr_now:.2e}  "
+                        f"vram={vram:.2f}GB"
+                    )
+
+                # Checkpoint mỗi 30 phút
+                if time.time() - last_ckpt_time >= CKPT_INTERVAL:
+                    save_ckpt(model, optimizer, scheduler, epoch, global_step, last_loss)
+                    last_ckpt_time = time.time()
+
+        # Cuối epoch
+        if epoch_valid_steps > 0:
+            avg_ep = epoch_loss / epoch_valid_steps
+            print(f"\n{'─'*60}")
+            print(f"  ✓ Epoch {epoch+1}/{NUM_EPOCHS} done  |  avg_loss={avg_ep:.4f}  |  valid_steps={epoch_valid_steps}")
+            print(f"{'─'*60}\n")
+            save_ckpt(model, optimizer, scheduler, epoch + 1, global_step, avg_ep)
+        else:
+            print(f"  [WARN] Epoch {epoch+1} không có valid step nào (toàn NaN)!")
+        last_ckpt_time = time.time()
+
+    print("[INFO] Training hoàn tất.")
 
     signal.signal(signal.SIGINT, _on_stop)
 
@@ -694,14 +556,4 @@ def train(model: MTT, train_by_lang: dict, test_by_lang: dict, nlp=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-    nlp = _load_spacy("xx_ent_wiki_sm")
-
-    print("  Fetching data from HuggingFace OPUS-100...\n")
-    train_by_lang, test_by_lang = fetch_all_pairs()
-
-    model = MTT()
-    model.paramsCalc()
-
-    train(model, train_by_lang, test_by_lang, nlp)
+    train()

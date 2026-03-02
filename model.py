@@ -1,344 +1,299 @@
+"""
+model.py
+Pipeline: raw text → Tokenizer → mmBERT-small → NER → Projector → mT5-small decoder → text
+"""
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as func
+import torch.nn.functional as F
+
+# Dùng Auto classes để tránh import chain dài gây lỗi torchvision
 from transformers import (
     AutoModel,
-    MT5ForConditionalGeneration,
-    AutoTokenizer
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,   # load mT5 qua Auto thay vì MT5ForConditionalGeneration
 )
+from transformers import T5Tokenizer   # MT5Tokenizer kế thừa T5Tokenizer, tránh import MT5Tokenizer trực tiếp
+
 
 class MTT(nn.Module):
+    """
+    Pipeline hoàn chỉnh:
+        raw src text
+          ──► enc_tokenizer             (AutoTokenizer / mmBERT-small)
+          ──► mmBERT-small encoder      → enc_hidden    (B, src_len, enc_dim=512)
+          ──► NERClassifier             → ner_logits    (B, src_len, 10)
+          ──► nerEmbed(argmax)          → ner_emb       (B, src_len, 512)
+          ──► enc_hidden + ner_emb
+          ──► Projector (Linear)        → projected     (B, src_len, dec_dim=512)
+          ──► mT5-small decoder stack   → dec_hidden    (B, tgt_len, 512)
+          ──► LM head                   → logits        (B, tgt_len, vocab_size)
+          ──► decoded text
+    """
+
+    NER_LAMBDA  = 0.3
+    MAX_SRC_LEN = 128
+    MAX_TGT_LEN = 128
+
+    NER_VOCAB = {
+        'O': 0, 'PERSON': 1, 'ORG': 2, 'LOC': 3, 'GPE': 4,
+        'DATE': 5, 'MONEY': 6, 'PERCENT': 7, 'TIME': 8, 'QUANTITY': 9,
+    }
+
     def __init__(self):
         super().__init__()
 
-        self.targetLanguages = ["de", "fr", "vi", "en", "es"]
-        specialTokens = [f"<2{lang}>" for lang in self.targetLanguages]
-        
-        #encoder
-        encoderName = "jhu-clsp/mmBERT-small"
-        self.tokenizer = AutoTokenizer.from_pretrained(encoderName)
-        self.tokenizer.add_special_tokens({"additional_special_tokens": specialTokens})
-        self.encoder = AutoModel.from_pretrained(encoderName)
-        self.encoder.resize_token_embeddings(len(self.tokenizer))
-        encoderHiddenSize = self.encoder.config.hidden_size
+        # ── 1. Tokenizers ────────────────────────────────────────────────────
+        self.enc_tokenizer = AutoTokenizer.from_pretrained("jhu-clsp/mmBERT-small")
+        self.dec_tokenizer = T5Tokenizer.from_pretrained("google/mt5-small")
 
-        #NER
-        self.nerVocab = {
-            'O': 0, 'PERSON': 1, 'ORG': 2, 'LOC': 3, 'GPE': 4,
-            'DATE': 5, 'MONEY': 6, 'PERCENT': 7, 'TIME': 8, 'QUANTITY': 9
-        }
+        # ── 2. mmBERT-small Encoder ──────────────────────────────────────────
+        self.encoder = AutoModel.from_pretrained("jhu-clsp/mmBERT-small")
+        enc_dim = self.encoder.config.hidden_size   # 512
+
+        # ── 3. NER head ──────────────────────────────────────────────────────
         self.nerEmbed = nn.Embedding(
-            num_embeddings = len(self.nerVocab),
-            embedding_dim = encoderHiddenSize
+            num_embeddings=len(self.NER_VOCAB),
+            embedding_dim=enc_dim,
         )
-        self.nerClassifier = nn.Linear(
-            encoderHiddenSize,
-            len(self.nerVocab)
+        self.nerClassifier = nn.Linear(enc_dim, len(self.NER_VOCAB))
+
+        # ── 4. mT5-small – lấy decoder stack + lm_head, bỏ encoder ──────────
+        _mt5    = AutoModelForSeq2SeqLM.from_pretrained("google/mt5-small")
+        dec_dim = _mt5.config.hidden_size   # 512
+
+        self.decoder = _mt5.decoder         # MT5Stack
+        self.lm_head = _mt5.lm_head         # Linear(512, vocab_size, bias=False)
+        del _mt5                             # giải phóng encoder của mT5
+
+        # ── 5. Projector: enc_dim → dec_dim ──────────────────────────────────
+        self.projector = nn.Linear(enc_dim, dec_dim)
+
+        # Toàn bộ params đều train
+        for p in self.parameters():
+            p.requires_grad = True
+
+    # =========================================================================
+    # INTERNAL: TOKENIZE
+    # =========================================================================
+
+    def _tokenize_src(self, texts: list[str]):
+        """Tokenize raw source text bằng mmBERT tokenizer."""
+        device = next(self.encoder.parameters()).device
+        enc = self.enc_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.MAX_SRC_LEN,
+            return_tensors="pt",
         )
+        # ModernBERT (jhu-clsp/mmBERT-small) không có token_type_ids
+        return {
+            "input_ids":      enc["input_ids"].to(device),
+            "attention_mask": enc["attention_mask"].to(device),
+        }
 
-        #decoder
-        mt5 = MT5ForConditionalGeneration.from_pretrained("google/mt5-small")
-        mt5.resize_token_embeddings(len(self.tokenizer))
-        self.decoder = mt5.decoder
-        self.lmHead = mt5.lm_head
-        self.decoderStartTokenId = mt5.config.decoder_start_token_id or mt5.config.pad_token_id
-        del mt5
-
-        #projector
-        self.projector = nn.Linear(
-            encoderHiddenSize,
-            self.decoder.config.hidden_size
-        )
-
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-        for param in self.decoder.parameters():
-            param.requires_grad = True
-        for param in self.projector.parameters():
-            param.requires_grad = True
-        for param in self.lmHead.parameters():
-            param.requires_grad = True
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # LOAD CHECKPOINT
-    # ══════════════════════════════════════════════════════════════════════════
-
-    @classmethod
-    def load(cls, checkpoint_path: str, device: str = "cpu") -> "MTT":
+    def _tokenize_tgt(self, texts: list[str]):
         """
-        Tạo model mới rồi load weights từ file checkpoint của train.py.
-
-        Ví dụ:
-            model = MTT.load("mtt_checkpoint.pt", device="cpu")
-            model.eval()
-
-        Args:
-            checkpoint_path : đường dẫn tới file .pt do train.py lưu
-            device          : "cpu" hoặc "cuda"
-
-        Returns:
-            MTT instance đã load weights, ở chế độ eval
+        Tokenize raw target text bằng mT5 tokenizer.
+        Trả về:
+          decoder_input_ids  – shifted right  (BOS = pad_token_id theo T5/mT5 convention)
+          labels             – padding → -100
         """
-        if not torch.cuda.is_available() and device == "cuda":
-            print("[LOAD] CUDA không khả dụng, chuyển sang CPU.")
-            device = "cpu"
+        device = next(self.encoder.parameters()).device
+        enc = self.dec_tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.MAX_TGT_LEN,
+            return_tensors="pt",
+        )
+        ids = enc["input_ids"].to(device)
 
-        print(f"[LOAD] Đang khởi tạo model...")
-        model = cls()
+        # Shift right
+        bos = torch.full(
+            (ids.size(0), 1),
+            self.dec_tokenizer.pad_token_id,
+            dtype=torch.long, device=device,
+        )
+        decoder_input_ids = torch.cat([bos, ids[:, :-1]], dim=1)
 
-        print(f"[LOAD] Đang load checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        # Labels: padding → -100
+        labels = ids.clone()
+        labels[labels == self.dec_tokenizer.pad_token_id] = -100
 
-        # Checkpoint từ train.py lưu key "model" chứa state_dict
-        if "model" in ckpt:
-            state_dict = ckpt["model"]
-            print(f"[LOAD] Global step : {ckpt.get('global_step', '?')}")
-            print(f"[LOAD] Cycle        : {ckpt.get('cycle', '?')}")
-            print(f"[LOAD] LR cuối      : {ckpt.get('lr', '?')}")
-        else:
-            # Nếu file là raw state_dict (lưu thẳng không qua train.py)
-            state_dict = ckpt
+        return decoder_input_ids, labels
 
-        model.load_state_dict(state_dict)
-        model.to(device)
-        model.eval()
-        print(f"[LOAD] Load thành công! Model sẵn sàng trên {device}.\n")
-        return model
+    # =========================================================================
+    # FORWARD
+    # =========================================================================
 
-    # ══════════════════════════════════════════════════════════════════════════
+    def forward(
+        self,
+        src_texts: list[str],   # raw source strings
+        tgt_texts: list[str],   # raw target strings
+        ner_labels=None,        # (B, src_len) int64 tensor, -100 ở padding, optional
+    ):
+        # Step 1: Tokenize
+        src_enc                   = self._tokenize_src(src_texts)
+        decoder_input_ids, labels = self._tokenize_tgt(tgt_texts)
+
+        # Step 2: mmBERT-small encode
+        enc_hidden = self.encoder(
+            input_ids=src_enc["input_ids"],
+            attention_mask=src_enc["attention_mask"],
+        ).last_hidden_state                                    # (B, src_len, 512)
+
+        # Step 3: NER classify + embed
+        ner_logits = self.nerClassifier(enc_hidden)            # (B, src_len, 10)
+        ner_emb    = self.nerEmbed(ner_logits.argmax(-1))      # (B, src_len, 512)
+
+        # Step 4: Inject NER + Project
+        projected = self.projector(enc_hidden + ner_emb)       # (B, src_len, 512)
+
+        # Step 5: mT5 decoder (use_cache=False bắt buộc khi gradient checkpointing bật)
+        dec_hidden = self.decoder(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=projected,
+            encoder_attention_mask=src_enc["attention_mask"],
+            use_cache=False,
+        ).last_hidden_state                                    # (B, tgt_len, 512)
+
+        # Step 6: LM head
+        logits = self.lm_head(dec_hidden)                      # (B, tgt_len, vocab)
+
+        # Step 7: Generation loss
+        gen_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        # Step 8: NER loss (nếu có)
+        ner_loss = torch.tensor(0.0, device=enc_hidden.device)
+        if ner_labels is not None:
+            ner_loss = F.cross_entropy(
+                ner_logits.reshape(-1, len(self.NER_VOCAB)),
+                ner_labels.reshape(-1),
+                ignore_index=-100,
+            )
+
+        total_loss = gen_loss + self.NER_LAMBDA * ner_loss
+        return total_loss, gen_loss.detach(), ner_loss.detach()
+
+    # =========================================================================
+    # GENERATE
+    # =========================================================================
+
+    @torch.no_grad()
+    def generate(
+        self,
+        src_texts: list[str],
+        max_new_tokens: int       = 64,
+        repetition_penalty: float = 1.5,  # > 1 → phạt token lặp lại
+    ):
+        """
+        Greedy decode + repetition penalty.
+        Input : raw source strings
+        Output: decoded strings
+        """
+        device = next(self.encoder.parameters()).device
+        B      = len(src_texts)
+        eos_id = self.dec_tokenizer.eos_token_id
+        pad_id = self.dec_tokenizer.pad_token_id
+
+        # ── Encode ───────────────────────────────────────────────────────────
+        src_enc    = self._tokenize_src(src_texts)
+        enc_hidden = self.encoder(
+            input_ids=src_enc["input_ids"],
+            attention_mask=src_enc["attention_mask"],
+        ).last_hidden_state
+
+        ner_emb   = self.nerEmbed(self.nerClassifier(enc_hidden).argmax(-1))
+        projected = self.projector(enc_hidden + ner_emb)   # (B, src_len, dec_dim)
+
+        # ── Greedy decode ─────────────────────────────────────────────────────
+        dec_ids  = torch.full((B, 1), pad_id, dtype=torch.long, device=device)
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        for _ in range(max_new_tokens):
+            dec_out = self.decoder(
+                input_ids=dec_ids,
+                encoder_hidden_states=projected,
+                encoder_attention_mask=src_enc["attention_mask"],
+                use_cache=False,
+            )
+            # Logits của token cuối cùng
+            logits = self.lm_head(dec_out.last_hidden_state[:, -1]).float()  # (B, vocab)
+
+            # Repetition penalty
+            for b in range(B):
+                seen = dec_ids[b].unique()
+                # Token xuất hiện nhiều hơn 1 lần bị phạt nặng hơn
+                for tok_id in seen:
+                    count = (dec_ids[b] == tok_id).sum().item()
+                    penalty = repetition_penalty ** count
+                    if logits[b, tok_id] > 0:
+                        logits[b, tok_id] /= penalty
+                    else:
+                        logits[b, tok_id] *= penalty
+
+            next_tok = logits.argmax(-1, keepdim=True)   # (B, 1)  greedy
+
+            # Sequence đã kết thúc → pad
+            next_tok[finished] = pad_id
+            dec_ids  = torch.cat([dec_ids, next_tok], dim=1)
+
+            finished |= (next_tok.squeeze(-1) == eos_id)
+            if finished.all():
+                break
+
+        # Bỏ token BOS (pad_id đầu), decode
+        return self.dec_tokenizer.batch_decode(dec_ids[:, 1:], skip_special_tokens=True)
+
+    # =========================================================================
+    # UTILS
+    # =========================================================================
 
     def paramsCalc(self):
-        encoderPara = sum(p.numel() for p in self.encoder.parameters())
-        embedPara = sum(p.numel() for p in self.nerEmbed.parameters())
-        nerPara = sum(p.numel() for p in self.nerClassifier.parameters())
-        proPara = sum(p.numel() for p in self.projector.parameters())
-        decoderPara = sum(p.numel() for p in self.decoder.parameters())
-        lmPara = sum(p.numel() for p in self.lmHead.parameters())
-
-        print("Total: ", encoderPara + embedPara + nerPara + proPara + decoderPara + lmPara)
-
-    def _shiftRight(self, inputIds: torch.Tensor) -> torch.Tensor:
-        """Shift input ids one position right, prepend decoder_start_token_id (teacher forcing)."""
-        shifted = inputIds.new_zeros(inputIds.shape)
-        shifted[:, 1:] = inputIds[:, :-1].clone()
-        shifted[:, 0]  = self.decoderStartTokenId
-        shifted[shifted == -100] = self.tokenizer.pad_token_id
-        return shifted
-
-    def forward(self, srcText, targetLang, targetText=None, nerTags=None, returnLoss=True, device="cpu"):
-        taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
-        srcEncoded = self.tokenizer(
-            taggedSrc,
-            return_tensors = "pt",
-            padding = True,
-            truncation = True,
-            max_length = 128
-        ).to(device)
-        labels = None
-        decoderInputIds = None
-    
-        if targetText is not None:
-            targetEncoded = self.tokenizer(
-                targetText,
-                return_tensors = "pt",
-                padding = True,
-                truncation = True,
-                max_length = 128
-            ).to(device)
-            
-            labels = targetEncoded.input_ids.clone()
-            labels[labels == self.tokenizer.pad_token_id] = -100
-
-            decoderInputIds = self._shiftRight(labels)
-
-        encoderOut = self.encoder(
-            input_ids = srcEncoded.input_ids,
-            attention_mask = srcEncoded.attention_mask
-        ).last_hidden_state
-        
-        nerLogits = self.nerClassifier(encoderOut)
-
-        nerLoss = None
-        if nerTags is not None:
-            nerTags = nerTags.to(device)
-            nerLoss = func.cross_entropy(
-                nerLogits.view(-1, len(self.nerVocab)),
-                nerTags.view(-1),
-                ignore_index = -100
-            )
-
-        tagIndices = nerTags if nerTags is not None else nerLogits.argmax(dim=-1)
-        tagIndices = tagIndices.clamp(min=0)
-        nerEmbeds = self.nerEmbed(tagIndices)
-        nerOut = encoderOut + nerEmbeds
-
-        projected = self.projector(nerOut)
-
-        if decoderInputIds is None:
-            decoderInputIds = torch.full(
-                (projected.size(0), 1),
-                self.decoderStartTokenId,
-                dtype=torch.long,
-                device=device
-            )
-
-        decoderOut = self.decoder(
-            input_ids              = decoderInputIds,
-            encoder_hidden_states  = projected,
-            encoder_attention_mask = srcEncoded.attention_mask,
-            return_dict            = True
-        )
-
-        logits = self.lmHead(decoderOut.last_hidden_state)
-
-        translationLoss = None
-        if labels is not None:
-            translationLoss = func.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index = -100
-            )
-
-        totalLoss = None
-        if returnLoss and translationLoss is not None:
-            totalLoss = translationLoss
-            if nerLoss is not None:
-                totalLoss = translationLoss + 0.2 * nerLoss
-
-        return {
-            "loss": totalLoss,
-            "translationLoss": translationLoss,
-            "nerLoss": nerLoss,
-            "logits": logits,
-            "nerLogits": nerLogits
+        parts = {
+            "encoder"      : self.encoder,
+            "nerEmbed"     : self.nerEmbed,
+            "nerClassifier": self.nerClassifier,
+            "projector"    : self.projector,
+            "decoder"      : self.decoder,
+            "lm_head"      : self.lm_head,
         }
+        total = 0
+        for name, module in parts.items():
+            n = sum(p.numel() for p in module.parameters())
+            total += n
+            print(f"  {name:<16}: {n:>12,}")
+        print(f"  {'TOTAL':<16}: {total:>12,}")
 
-    def translate(
-        self,
-        srcText: list[str],
-        targetLang: str,
-        maxNewTokens: int = 128,
-        numBeams: int = 4,
-        device: str = "cpu"
-    ) -> list[str]:
+    def enable_gradient_checkpointing(self):
+        if hasattr(self.encoder, "gradient_checkpointing_enable"):
+            self.encoder.gradient_checkpointing_enable()
+        if hasattr(self.decoder, "gradient_checkpointing_enable"):
+            self.decoder.gradient_checkpointing_enable()
 
-        assert targetLang in self.targetLanguages, \
-            f"Unsupported target language '{targetLang}'. Choose from {self.targetLanguages}."
 
-        self.eval()
-        with torch.no_grad():
-            taggedSrc = [f"<2{targetLang}> {text}" for text in srcText]
-            srcEncoded = self.tokenizer(
-                taggedSrc,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=128
-            ).to(device)
+# ─── Quick test khi chạy trực tiếp ───────────────────────────────────────────
+if __name__ == "__main__":
+    print("[TEST] Khởi tạo MTT model…")
+    model = MTT()
+    print("[TEST] Param count:")
+    model.paramsCalc()
 
-            encoderOut = self.encoder(
-                input_ids=srcEncoded.input_ids,
-                attention_mask=srcEncoded.attention_mask
-            ).last_hidden_state
+    print("\n[TEST] Forward pass với dummy data…")
+    loss, gen, ner = model(
+        src_texts=["The president of France visited Vietnam."],
+        tgt_texts=["Tổng thống Pháp đã thăm Việt Nam."],
+    )
+    print(f"  total_loss={loss.item():.4f}  gen={gen.item():.4f}  ner={ner.item():.4f}")
 
-            nerLogits = self.nerClassifier(encoderOut)
-            predTags  = nerLogits.argmax(dim=-1)
-            nerEmbeds = self.nerEmbed(predTags)
-            nerOut    = encoderOut + nerEmbeds
+    print("\n[TEST] Generate…")
+    out = model.generate(["Hello world, this is a test."])
+    print(f"  output: {out}")
 
-            projected = self.projector(nerOut)
-
-            batchSize   = projected.size(0)
-            bosTokenId  = self.decoderStartTokenId
-            eosTokenId  = self.tokenizer.eos_token_id
-            padTokenId  = self.tokenizer.pad_token_id
-
-            expanded = projected.unsqueeze(1) \
-                            .expand(-1, numBeams, -1, -1) \
-                            .reshape(batchSize * numBeams, projected.size(1), projected.size(2))
-
-            expandedMask = srcEncoded.attention_mask \
-                                 .unsqueeze(1) \
-                                 .expand(-1, numBeams, -1) \
-                                 .reshape(batchSize * numBeams, -1)
-
-            beamScores  = torch.zeros(batchSize, numBeams, device=device)
-            beamScores[:, 1:] = -1e9
-            beamScores  = beamScores.view(-1)
-
-            inputIds = torch.full(
-                (batchSize * numBeams, 1),
-                bosTokenId,
-                dtype=torch.long,
-                device=device
-            )
-
-            done         = [False] * batchSize
-            finishedSeqs = [[] for _ in range(batchSize)]
-
-            for _ in range(maxNewTokens):
-                decoderOut = self.decoder(
-                    input_ids=inputIds,
-                    encoder_hidden_states=expanded,
-                    encoder_attention_mask=expandedMask,
-                    return_dict=True
-                )
-                logits      = self.lmHead(decoderOut.last_hidden_state[:, -1, :])
-                logProbs    = torch.log_softmax(logits, dim=-1)
-
-                vocabSize   = logProbs.size(-1)
-                nextScores  = beamScores.unsqueeze(-1) + logProbs
-                nextScores  = nextScores.view(batchSize, numBeams * vocabSize)
-
-                topScores, topIndices = torch.topk(nextScores, 2 * numBeams, dim=-1)
-
-                nextBeamScores  = []
-                nextBeamTokens  = []
-                nextBeamOrigins = []
-
-                for b in range(batchSize):
-                    if done[b]:
-                        nextBeamScores.extend([0.0] * numBeams)
-                        nextBeamTokens.extend([padTokenId] * numBeams)
-                        nextBeamOrigins.extend(list(range(b * numBeams, (b + 1) * numBeams)))
-                        continue
-
-                    beamsCounted = 0
-                    for score, idx in zip(topScores[b].tolist(), topIndices[b].tolist()):
-                        beamIdx    = idx // vocabSize
-                        tokenIdx   = idx  % vocabSize
-                        globalBeam = b * numBeams + beamIdx
-
-                        if tokenIdx == eosTokenId:
-                            finishedSeqs[b].append((score, inputIds[globalBeam].tolist()))
-                        else:
-                            nextBeamScores.append(score)
-                            nextBeamTokens.append(tokenIdx)
-                            nextBeamOrigins.append(globalBeam)
-                            beamsCounted += 1
-
-                        if beamsCounted == numBeams:
-                            break
-
-                    if len(finishedSeqs[b]) >= numBeams:
-                        done[b] = True
-
-                if all(done):
-                    break
-
-                beamScores = torch.tensor(nextBeamScores, device=device)
-                nextTokens = torch.tensor(nextBeamTokens, dtype=torch.long, device=device).unsqueeze(-1)
-                inputIds   = torch.cat([inputIds[nextBeamOrigins], nextTokens], dim=-1)
-
-            translations = []
-            for b in range(batchSize):
-                if finishedSeqs[b]:
-                    best     = max(finishedSeqs[b], key=lambda x: x[0])
-                    tokenIds = best[1][1:]
-                else:
-                    tokenIds = inputIds[b * numBeams].tolist()[1:]
-
-                text = self.tokenizer.decode(tokenIds, skip_special_tokens=True)
-                translations.append(text)
-
-            return translations
+    print("\n[OK] model.py chạy thành công!")
