@@ -14,6 +14,7 @@ Chỉnh nếu OOM: giảm MAX_SRC_LEN / MAX_TGT_LEN trong model.py (128 → 64)
 import os, time, signal, math
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import spacy
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import get_cosine_schedule_with_warmup
@@ -180,6 +181,7 @@ def train():
         collate_fn=collate,
         drop_last=True,
     )
+    return ckpt["global_step"], ckpt["cycle"]
 
     # Scheduler
     steps_per_epoch = math.ceil(len(dataset) / (BATCH_SIZE * GRAD_ACCUM))
@@ -333,6 +335,225 @@ def train():
 
     print("[INFO] Training hoàn tất.")
 
+    signal.signal(signal.SIGINT, _on_stop)
+
+    last_ckpt = time.time()
+    eff_batch = CFG["batch_size"] * accum_steps
+
+    amp_label = f"bf16" if (use_amp and amp_dtype == torch.bfloat16) else "fp32 (AMP off)"
+    print(f"\n{'═'*64}")
+    print(f"  MTT Training  |  device={device}  |  lr={CFG['lr']:.2e}")
+    print(
+        f"  micro-batch={CFG['batch_size']}  accum={accum_steps}  effective batch={eff_batch}"
+    )
+    print(f"  Precision : {amp_label}  |  Gradient checkpointing : ON")
+    print(
+        f"  Cycle = {CFG['train_steps']} train steps + {CFG['test_steps']} test steps"
+    )
+    print(f"  Each step = one monolingual batch (one language, always correct)")
+    print(f"  Languages : {train_langs}")
+    print(
+        f"  LR: warmup {CFG['warmup_steps']} steps → cosine/cycle → min={CFG['lr_min']:.1e}"
+    )
+    print(f"  NER: spaCy → offset_mapping align → forward() nerTags")
+    print(f"  Checkpoint every {CFG['checkpoint_minutes']} min + end of each cycle")
+    print(f"  Press Ctrl+C to stop safely at any time")
+    print(f"{'═'*64}\n")
+
+    while not stop:
+        cycle += 1
+
+        print(f"\n{'─'*64}")
+        print(f"  CYCLE {cycle}  |  global step: {global_step}")
+        print(f"{'─'*64}\n")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE 1 — TRAIN
+        # ══════════════════════════════════════════════════════════════════════
+        model.train()
+        train_loss_sum = 0.0
+        accum_loss = 0.0
+        train_step = 0
+        optimizer.zero_grad(set_to_none=True)
+
+        # Shuffled language schedule — one language per micro-step.
+        total_micro = CFG["train_steps"] * accum_steps
+        schedule = []
+        while len(schedule) < total_micro:
+            block = train_langs.copy()
+            random.shuffle(block)
+            schedule.extend(block)
+        schedule = schedule[:total_micro]
+
+        langs_in_step = []
+
+        for micro_step, lang in enumerate(schedule, 1):
+            if stop:
+                break
+            langs_in_step.append(lang)
+            srcs, tgts = next(train_iters[lang])
+
+            # ── NER: spaCy → align offset → nerTags ──────────────────────────
+            ner_tags = None
+            if nlp is not None:
+                try:
+                    ner_tags = _extract_ner_tags(
+                        src_texts=srcs,
+                        target_lang=lang,
+                        nlp=nlp,
+                        tokenizer=model.tokenizer,
+                        ner_vocab=model.nerVocab,
+                        max_length=128,
+                        device=device,
+                    )
+                except Exception as e:
+                    print(f"  [NER ]  WARNING: {e} — skipping nerTags this step")
+
+            with autocast(device, dtype=amp_dtype, enabled=use_amp):
+                out = model(
+                    srcText=srcs,
+                    targetLang=lang,
+                    targetText=tgts,
+                    nerTags=ner_tags,
+                    returnLoss=True,
+                    device=device,
+                )
+                loss = out["loss"] / accum_steps
+
+            # scaler.scale() là no-op khi enabled=False → backward thẳng
+            scaler.scale(loss).backward()
+            accum_loss += loss.item()
+
+            if micro_step % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                global_step += 1
+                train_step += 1
+                train_loss_sum += accum_loss
+
+                trans = out["translationLoss"]
+                ner = out["nerLoss"]
+                langs_str = "+".join(langs_in_step)
+                print(
+                    f"  [TRAIN]"
+                    f"  global={global_step:>7}"
+                    f"  cycle={cycle}  step={train_step:>3}/{CFG['train_steps']}"
+                    f"  langs=[{langs_str}]"
+                    f"  loss={accum_loss:.4f}"
+                    + (
+                        f"  trans={trans.item()/accum_steps:.4f}"
+                        if trans is not None
+                        else ""
+                    )
+                    + (f"  ner={ner.item()/accum_steps:.4f}" if ner is not None else "")
+                    + f"  lr={optimizer.param_groups[0]['lr']:.2e}"
+                )
+                accum_loss = 0.0
+                langs_in_step = []
+
+                if time.time() - last_ckpt >= ckpt_sec:
+                    save_checkpoint(
+                        model, optimizer, scheduler, scaler, global_step, cycle
+                    )
+                    last_ckpt = time.time()
+
+                if global_step % 50 == 0 and device == "cuda":
+                    torch.cuda.empty_cache()
+
+        avg_train = train_loss_sum / max(train_step, 1)
+        print(f"\n  [CYCLE {cycle}]  ── Train done ──  avg loss: {avg_train:.4f}\n")
+
+        if stop:
+            break
+
+        # ══════════════════════════════════════════════════════════════════════
+        # PHASE 2 — TEST
+        # ══════════════════════════════════════════════════════════════════════
+        model.eval()
+        test_loss_sum = 0.0
+        test_trans_sum = 0.0
+        test_ner_sum = 0.0
+
+        test_schedule = []
+        while len(test_schedule) < CFG["test_steps"]:
+            block = test_langs.copy()
+            random.shuffle(block)
+            test_schedule.extend(block)
+        test_schedule = test_schedule[: CFG["test_steps"]]
+
+        with torch.no_grad():
+            for test_step, lang in enumerate(test_schedule, 1):
+                srcs, tgts = next(test_iters[lang])
+
+                ner_tags = None
+                if nlp is not None:
+                    try:
+                        ner_tags = _extract_ner_tags(
+                            src_texts=srcs,
+                            target_lang=lang,
+                            nlp=nlp,
+                            tokenizer=model.tokenizer,
+                            ner_vocab=model.nerVocab,
+                            max_length=128,
+                            device=device,
+                        )
+                    except Exception:
+                        pass
+
+                with autocast(device, dtype=amp_dtype, enabled=use_amp):
+                    out = model(
+                        srcText=srcs,
+                        targetLang=lang,
+                        targetText=tgts,
+                        nerTags=ner_tags,
+                        returnLoss=True,
+                        device=device,
+                    )
+
+                lv = out["loss"].item()
+                test_loss_sum += lv
+                if out["translationLoss"] is not None:
+                    test_trans_sum += out["translationLoss"].item()
+                if out["nerLoss"] is not None:
+                    test_ner_sum += out["nerLoss"].item()
+
+                print(
+                    f"  [TEST ]"
+                    f"  global={global_step:>7}"
+                    f"  cycle={cycle}  test_step={test_step:>3}/{CFG['test_steps']}"
+                    f"  lang={lang}"
+                    f"  loss={lv:.4f}"
+                )
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+        n = CFG["test_steps"]
+        avg_test = test_loss_sum / n
+        avg_trans = test_trans_sum / n
+        avg_ner = test_ner_sum / n
+        print(
+            f"\n  [CYCLE {cycle}]  ── Test done ──  "
+            f"avg loss: {avg_test:.4f}  trans: {avg_trans:.4f}  ner: {avg_ner:.4f}  "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+        )
+
+        print()
+        save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
+        last_ckpt = time.time()
+
+    save_checkpoint(model, optimizer, scheduler, scaler, global_step, cycle)
+    print(f"\n  Stopped at global step {global_step}, cycle {cycle}. Goodbye!")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     train()
